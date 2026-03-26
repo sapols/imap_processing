@@ -10,8 +10,13 @@ from imap_processing.mag.l1c.interpolation_methods import (
     estimate_rate,
 )
 from imap_processing.mag.l1c.mag_l1c import (
+    build_decimated_indices,
+    build_gap_fill_plan,
+    build_gap_fill_plans,
+    build_timeline_from_gap_plans,
     fill_normal_data,
     find_all_gaps,
+    find_nearest_epoch_index,
     find_gaps,
     generate_missing_timestamps,
     generate_timeline,
@@ -128,7 +133,6 @@ def test_process_mag_l1c(norm_dataset, burst_dataset):
                 4.5,
                 4.75,
                 5,
-                5.25,
                 5.5,
                 5.75,
                 6,
@@ -137,18 +141,10 @@ def test_process_mag_l1c(norm_dataset, burst_dataset):
         * 1e9
     )
     assert np.array_equal(l1c[:, 0], expected_output_timeline)
-    # Last new timestamp is missing data because burst mode only goes to 5.15
-    # Don't generate data if there's no burst data to interpolate
-    assert (
-        np.count_nonzero([np.sum(l1c[i, 1:4]) for i in range(l1c.shape[0])])
-        == l1c.shape[0] - 1
-    )
-    expected_flags = np.zeros(17)
+    expected_flags = np.zeros(16)
     # filled sections should have 1 as a flag
     expected_flags[5:8] = 1
     expected_flags[10:13] = 1
-    # last datapoint in the gap is missing a value
-    expected_flags[13] = -1
     assert np.array_equal(l1c[:, 5], expected_flags)
     assert np.array_equal(l1c[:5, 1:5], norm_dataset["vectors"].data[:5, :])
     for i in range(5, 8):
@@ -170,8 +166,7 @@ def test_process_mag_l1c(norm_dataset, burst_dataset):
         # identical.
         assert np.allclose(l1c[i, 1:5], burst_vectors, rtol=0, atol=1)
 
-    assert np.array_equal(l1c[13, 1:5], [0, 0, 0, 0])
-    assert np.array_equal(l1c[14:, 1:5], norm_dataset["vectors"].data[7:, :])
+    assert np.array_equal(l1c[13:, 1:5], norm_dataset["vectors"].data[7:, :])
 
 
 def test_interpolate_gaps(norm_dataset, mag_l1b_dataset):
@@ -457,6 +452,18 @@ def test_find_gaps():
     assert np.array_equal(gaps, expected_return)
 
 
+def test_find_nearest_epoch_index_prefers_earlier_on_tie():
+    epoch_test = np.array([0, 10], dtype=np.int64)
+    assert find_nearest_epoch_index(epoch_test, 5) == 0
+    assert find_nearest_epoch_index(epoch_test, 8) == 1
+
+
+def test_build_decimated_indices_includes_anchor():
+    output = build_decimated_indices(anchor_index=4, step=2, start_index=0, end_index=10)
+    expected_output = np.array([0, 2, 4, 6, 8], dtype=np.int64)
+    assert np.array_equal(output, expected_output)
+
+
 def test_generate_missing_timestamps_uses_gap_rate():
     gap = np.array([1_000_000_000, 2_000_000_000, 4], dtype=np.int64)
     expected_output = np.array(
@@ -467,6 +474,89 @@ def test_generate_missing_timestamps_uses_gap_rate():
     legacy_gap = np.array([1_000_000_000, 2_000_000_000], dtype=np.int64)
     legacy_expected = np.array([1_000_000_000, 1_500_000_000], dtype=np.int64)
     assert np.array_equal(generate_missing_timestamps(legacy_gap), legacy_expected)
+
+
+def test_build_gap_fill_plan_uses_shifted_burst_timestamps(burst_dataset):
+    gap = np.array([2_000_000_000, 4_000_000_000, 2], dtype=np.int64)
+    gap_fill_plan = build_gap_fill_plan(
+        burst_dataset["epoch"].data, vectors_per_second_from_string("0:8"), gap
+    )
+
+    expected_epochs = np.array([2.5, 3.0, 3.5]) * 1e9
+    expected_source_indices = np.array([5, 9, 13], dtype=np.int64)
+    assert np.array_equal(gap_fill_plan.synthetic_epochs, expected_epochs)
+    assert np.array_equal(gap_fill_plan.source_indices, expected_source_indices)
+
+
+def test_build_gap_fill_plan_regularizes_burst_jitter():
+    burst_epochs = np.array(
+        [
+            1_900_000_000 + index * 125_000_000 + (10_000 if index % 2 else -10_000)
+            for index in range(27)
+        ],
+        dtype=np.int64,
+    )
+    gap = np.array([2_000_000_000, 4_000_000_000, 2], dtype=np.int64)
+    gap_fill_plan = build_gap_fill_plan(burst_epochs, {0: 8}, gap)
+
+    expected_epochs = np.array([2.5, 3.0, 3.5]) * 1e9
+    assert np.array_equal(gap_fill_plan.synthetic_epochs, expected_epochs)
+    assert np.array_equal(np.diff(gap_fill_plan.synthetic_epochs), np.full(2, 500_000_000))
+
+
+def test_build_gap_fill_plan_uses_observed_burst_transition_boundary():
+    burst_start = 794_967_834_906_065_000
+    burst_epochs = np.array(
+        [burst_start + index * 15_625_000 for index in range(512)], dtype=np.int64
+    )
+    gap = np.array([794_967_834_198_931_000, 794_967_837_198_931_000, 2], dtype=np.int64)
+    gap_fill_plan = build_gap_fill_plan(
+        burst_epochs,
+        {794_967_839_890_064_896: 64},
+        gap,
+    )
+
+    assert gap_fill_plan.synthetic_epochs[0] == 794_967_835_198_931_000
+    assert np.array_equal(
+        np.diff(gap_fill_plan.synthetic_epochs[:4]), np.full(3, 500_000_000)
+    )
+
+
+def test_build_gap_fill_plans_match_step_three_shifted_timeline(
+    norm_dataset, burst_dataset
+):
+    gaps = find_all_gaps(
+        norm_dataset["epoch"].data,
+        vectors_per_second_from_string(norm_dataset.attrs["vectors_per_second"]),
+    )
+    gap_fill_plans = build_gap_fill_plans(burst_dataset, gaps)
+    output_timeline = build_timeline_from_gap_plans(
+        norm_dataset["epoch"].data, gap_fill_plans
+    )
+    expected_timeline = (
+        np.array(
+            [
+                0,
+                0.5,
+                1,
+                1.5,
+                2,
+                2.5,
+                3,
+                3.5,
+                4,
+                4.25,
+                4.5,
+                4.75,
+                5,
+                5.5,
+                5.75,
+                6,
+            ]
+        )
+        * 1e9
+    )
+    assert np.array_equal(output_timeline, expected_timeline)
 
 
 def test_generate_timeline():
