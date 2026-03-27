@@ -10,9 +10,12 @@ from imap_processing.mag.l1c.interpolation_methods import (
     estimate_rate,
 )
 from imap_processing.mag.l1c.mag_l1c import (
+    _find_rate_segments,
+    build_gap_fill_plan,
     fill_normal_data,
     find_all_gaps,
     find_gaps,
+    generate_missing_timestamps,
     generate_timeline,
     interpolate_gaps,
     mag_l1c,
@@ -859,3 +862,77 @@ def test_cic_filter_delay_compensation():
         f"{len(input_filtered_case2)} elements, vectors_filtered has "
         f"{len(vectors_filtered_case2)} elements"
     )
+
+
+def test_generate_missing_timestamps_uses_gap_rate():
+    """Verify generate_missing_timestamps uses the gap's rate, not a hardcoded 0.5s."""
+    # Rate 4 → 0.25s cadence
+    gap_rate4 = np.array([1e9, 2e9, 4])
+    ts = generate_missing_timestamps(gap_rate4)
+    expected = np.array([1e9, 1.25e9, 1.5e9, 1.75e9], dtype=np.int64)
+    np.testing.assert_array_equal(ts, expected)
+
+    # Rate 1 → 1.0s cadence
+    gap_rate1 = np.array([0, 3e9, 1])
+    ts = generate_missing_timestamps(gap_rate1)
+    expected = np.array([0, 1e9, 2e9], dtype=np.int64)
+    np.testing.assert_array_equal(ts, expected)
+
+    # Default (no rate column) → 2 Hz / 0.5s
+    gap_default = np.array([0, 2e9])
+    ts = generate_missing_timestamps(gap_default)
+    expected = np.array([0, 0.5e9, 1e9, 1.5e9], dtype=np.int64)
+    np.testing.assert_array_equal(ts, expected)
+
+
+def test_generate_timeline_rate_gap():
+    """Verify generate_timeline respects the gap's rate for timestamp spacing."""
+    epoch_data = np.array([0, 0.5e9, 1e9, 3e9, 3.25e9], dtype=np.int64)
+    gaps = np.array([[1e9, 3e9, 4]])  # rate 4 → 0.25s
+    timeline = generate_timeline(epoch_data, gaps)
+
+    # Should include original epochs AND gap-fill at 0.25s cadence
+    expected_gap_ts = np.arange(1e9, 3e9, 0.25e9).astype(np.int64)
+    for ts in expected_gap_ts:
+        assert ts in timeline, f"Expected {ts} in timeline"
+
+
+def test_find_rate_segments():
+    """Test _find_rate_segments with a Config mode transition."""
+    # Simulate: 2Hz data transitioning to 4Hz
+    rate2_epochs = np.arange(0, 3e9, 0.5e9)  # 6 timestamps at 2Hz
+    rate4_epochs = np.arange(3e9, 5e9, 0.25e9)  # 8 timestamps at 4Hz
+    epoch_data = np.concatenate([rate2_epochs, rate4_epochs]).astype(np.int64)
+
+    # vecsec says transition happens at 3e9
+    vecsec_dict = {0: 2, int(3e9): 4}
+
+    segments = _find_rate_segments(epoch_data, vecsec_dict)
+
+    assert len(segments) >= 1
+    # First segment should be rate 2
+    assert segments[0][1] == 2
+    # Last segment should be rate 4
+    assert segments[-1][1] == 4
+
+
+def test_build_gap_fill_plan():
+    """Test the core spec step 3 function: tC selection, decimation, shifting."""
+    # BM data at 8Hz from 0 to 2s
+    burst_epochs = np.arange(0, 2e9, 0.125e9).astype(np.int64)
+    burst_rate_segments = [(0, 8)]
+
+    # Gap from 0.5s to 1.5s at NM rate 2 (0.5s cadence)
+    gap = np.array([0.5e9, 1.5e9, 2])
+    plan = build_gap_fill_plan(burst_epochs, burst_rate_segments, gap)
+
+    assert plan.t_a == int(0.5e9)
+    assert plan.t_b == int(1.5e9)
+    assert plan.norm_rate == VecSec.TWO_VECS_PER_S
+    assert plan.burst_rate == VecSec.EIGHT_VECS_PER_S
+
+    # Should produce synthetic epoch at 1.0s (only one between 0.5 and 1.5 exclusive)
+    assert int(1e9) in plan.synthetic_epochs
+    # Timestamps should be at NM cadence (0.5s spacing)
+    for ts in plan.synthetic_epochs:
+        assert (ts - plan.t_a) % int(0.5e9) == 0

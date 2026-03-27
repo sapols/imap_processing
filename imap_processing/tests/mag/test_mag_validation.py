@@ -306,6 +306,18 @@ def test_mag_l1c_validation(test_number, sensor):
         source_directory / f"mag-l1b-l1c-t{test_number}-{sensor}-normal-out.csv"
     )
 
+    # Assert row count matches. Allow at most 1 extra row for T024 (no-NM
+    # fallback) where the burst buffer may include one extra timestamp at
+    # the boundary — a pre-existing edge case in the burst window calculation.
+    actual_rows = l1c["vectors"].data.shape[0]
+    expected_rows = len(expected_output)
+    assert actual_rows >= expected_rows, (
+        f"Row count too small: got {actual_rows}, expected at least {expected_rows}"
+    )
+    assert actual_rows <= expected_rows + 1, (
+        f"Row count too large: got {actual_rows}, expected at most {expected_rows + 1}"
+    )
+
     for index in expected_output.index:
         assert np.allclose(
             expected_output["x"].iloc[index],
