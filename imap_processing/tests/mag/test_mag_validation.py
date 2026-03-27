@@ -12,6 +12,7 @@ from imap_processing.mag.constants import DataMode
 from imap_processing.mag.l1a.mag_l1a import mag_l1a
 from imap_processing.mag.l1a.mag_l1a_data import MagL1a, TimeTuple
 from imap_processing.mag.l1b.mag_l1b import mag_l1b
+from imap_processing.mag.constants import ModeFlags
 from imap_processing.mag.l1c.mag_l1c import mag_l1c
 from imap_processing.mag.l2.mag_l2 import mag_l2
 from imap_processing.spice.time import (
@@ -260,10 +261,7 @@ def test_mag_l1b_validation(test_number, mocks):
 @pytest.mark.parametrize(("sensor"), ["mago", "magi"])
 @pytest.mark.external_test_data
 def test_mag_l1c_validation(test_number, sensor):
-    if test_number not in ["013", "014", "024"]:
-        pytest.skip("All L1C edge cases are not yet complete")
-
-    # We expect tests 013 and 014 to pass. 015 and 016 are not yet complete.
+    #
     # timestamp = (
     #     (np.datetime64("2025-03-11T12:22:50.706034") - np.datetime64(TTJ2000_EPOCH))
     #     / np.timedelta64(1, "ns")
@@ -309,6 +307,8 @@ def test_mag_l1c_validation(test_number, sensor):
         source_directory / f"mag-l1b-l1c-t{test_number}-{sensor}-normal-out.csv"
     )
 
+    assert len(expected_output.index) == len(l1c["epoch"].data)
+
     for index in expected_output.index:
         assert np.allclose(
             expected_output["x"].iloc[index],
@@ -329,9 +329,42 @@ def test_mag_l1c_validation(test_number, sensor):
             rtol=0,
         )
 
+        if "range" in expected_output.columns and not pd.isna(
+            expected_output["range"].iloc[index]
+        ):
+            assert np.allclose(
+                expected_output["range"].iloc[index],
+                l1c["vectors"].data[index][3],
+                atol=1e-6,
+                rtol=0,
+            )
+
+        if "compression" in expected_output.columns and not pd.isna(
+            expected_output["compression"].iloc[index]
+        ):
+            assert (
+                expected_output["compression"].iloc[index]
+                == l1c["compression_flags"].data[index][0]
+            )
+
+        if "compression_width" in expected_output.columns and not pd.isna(
+            expected_output["compression_width"].iloc[index]
+        ):
+            assert (
+                expected_output["compression_width"].iloc[index]
+                == l1c["compression_flags"].data[index][1]
+            )
+
+        if "interp" in expected_output.columns:
+            expected_interp = bool(expected_output["interp"].iloc[index])
+            actual_interp = (
+                l1c["generated_flag"].data[index] == ModeFlags.BURST.value
+            )
+            assert expected_interp == actual_interp
+
         expected_time = np.datetime64(expected_output["t"].iloc[index])
         l1c_time = TTJ2000_EPOCH + l1c["epoch"].data[index].astype("timedelta64[ns]")
-        assert expected_time - l1c_time < np.timedelta64(500, "ms")
+        assert abs(expected_time - l1c_time) <= np.timedelta64(1, "ms")
 
 
 @pytest.mark.parametrize(("test_number", "mode"), [("021", "burst"), ("022", "norm")])
