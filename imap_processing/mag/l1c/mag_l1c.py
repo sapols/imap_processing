@@ -1,6 +1,7 @@
 """MAG L1C processing module."""
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
@@ -12,6 +13,46 @@ from imap_processing.mag.l1c.interpolation_methods import InterpolationFunction
 from imap_processing.spice.time import et_to_ttj2000ns, str_to_et
 
 logger = logging.getLogger(__name__)
+
+GAP_TOLERANCE = 0.075
+
+
+def _to_int64_ns(values: np.ndarray | list | tuple) -> np.ndarray:
+    """Convert timestamp-like values to nanosecond int64 without float round-trip loss."""
+    array = np.asarray(values)
+    if np.issubdtype(array.dtype, np.integer):
+        return array.astype(np.int64, copy=False)
+
+    return np.rint(array).astype(np.int64, copy=False)
+
+
+def _to_int64_ns_scalar(value: int | float | np.integer | np.floating) -> int:
+    """Scalar form of _to_int64_ns."""
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+
+    return int(np.rint(value))
+
+
+@dataclass(frozen=True)
+class GapFillPlan:
+    """
+    Synthetic NM timestamps and BM context for filling one gap.
+
+    `t_a` and `t_b` define the open NM interval to fill. `synthetic_epochs` are the
+    zero-jitter NM timestamps generated for that interval, and `source_indices` map
+    each synthetic timestamp back to the BM sample used for range/compression fields.
+    The burst-window indices describe the BM slice passed into interpolation.
+    """
+
+    t_a: int
+    t_b: int
+    norm_rate: VecSec
+    burst_rate: VecSec
+    synthetic_epochs: np.ndarray
+    source_indices: np.ndarray
+    burst_window_start: int
+    burst_window_end: int
 
 
 def mag_l1c(
@@ -331,7 +372,7 @@ def process_mag_l1c(
         day_end_ns = et_to_ttj2000ns(str_to_et(str(day_end)))
 
     if normal_mode_dataset:
-        norm_epoch = normal_mode_dataset["epoch"].data
+        norm_epoch = _to_int64_ns(normal_mode_dataset["epoch"].data)
         if "vectors_per_second" in normal_mode_dataset.attrs:
             normal_vecsec_dict = vectors_per_second_from_string(
                 normal_mode_dataset.attrs["vectors_per_second"]
@@ -340,6 +381,12 @@ def process_mag_l1c(
             normal_vecsec_dict = None
 
         gaps = find_all_gaps(norm_epoch, normal_vecsec_dict, day_start_ns, day_end_ns)
+        gap_fill_plans = build_gap_fill_plans(burst_mode_dataset, gaps)
+        new_timeline = build_timeline_from_gap_plans(norm_epoch, gap_fill_plans)
+        norm_filled: np.ndarray = fill_normal_data(normal_mode_dataset, new_timeline)
+        interpolated = interpolate_gaps(
+            burst_mode_dataset, gap_fill_plans, norm_filled, interpolation_function
+        )
     else:
         norm_epoch = [day_start_ns, day_end_ns]
         gaps = np.array(
@@ -351,19 +398,375 @@ def process_mag_l1c(
                 ]
             ]
         )
-
-    new_timeline = generate_timeline(norm_epoch, gaps)
-
-    if normal_mode_dataset:
-        norm_filled: np.ndarray = fill_normal_data(normal_mode_dataset, new_timeline)
-    else:
+        new_timeline = generate_timeline(norm_epoch, gaps)
         norm_filled = generate_empty_norm_array(new_timeline)
-
-    interpolated = interpolate_gaps(
-        burst_mode_dataset, gaps, norm_filled, interpolation_function
-    )
+        interpolated = interpolate_gaps(
+            burst_mode_dataset, gaps, norm_filled, interpolation_function
+        )
 
     return interpolated
+
+
+def get_vecsec_dict(
+    dataset: xr.Dataset | None, default_rate: int = VecSec.TWO_VECS_PER_S.value
+) -> dict[int, int]:
+    """Return a vectors-per-second mapping with a sensible default."""
+    if dataset is None or "vectors_per_second" not in dataset.attrs:
+        return {0: default_rate}
+
+    return vectors_per_second_from_string(dataset.attrs["vectors_per_second"])
+
+
+def _find_segment_for_time(
+    rate_segments: list[tuple[int, int]],
+    epoch_data: np.ndarray,
+    target_time: int,
+) -> tuple[VecSec, int, int]:
+    """
+    Return the active observed-cadence segment containing `target_time`.
+
+    Parameters
+    ----------
+    rate_segments : list[tuple[int, int]]
+        Pre-computed `(start_index, vectors_per_second)` segments.
+    epoch_data : np.ndarray
+        Sorted timestamp array in TTJ2000 nanoseconds.
+    target_time : int
+        Timestamp to resolve into a segment.
+
+    Returns
+    -------
+    tuple[VecSec, int, int]
+        The active rate plus the segment start/end indices.
+    """
+    epoch_data = _to_int64_ns(epoch_data)
+    if epoch_data.shape[0] == 0:
+        raise ValueError("Cannot resolve a rate segment for an empty epoch array.")
+
+    if len(rate_segments) == 0:
+        raise ValueError("Cannot resolve a rate segment without any segments.")
+
+    target_index = int(np.searchsorted(epoch_data, target_time, side="left"))
+    target_index = min(max(target_index, 0), epoch_data.shape[0] - 1)
+
+    segment_index = 0
+    for index, (segment_start, _) in enumerate(rate_segments):
+        if segment_start > target_index:
+            break
+        segment_index = index
+
+    segment_start, segment_rate = rate_segments[segment_index]
+    segment_end = epoch_data.shape[0]
+    if segment_index + 1 < len(rate_segments):
+        segment_end = rate_segments[segment_index + 1][0]
+
+    return VecSec(int(segment_rate)), int(segment_start), int(segment_end)
+
+
+def find_nearest_epoch_index(epoch_data: np.ndarray, target_time: int) -> int:
+    """
+    Return the index of the timestamp nearest `target_time`.
+
+    Ties are resolved toward the earlier timestamp so the step-3 anchor `tC` is
+    deterministic when `target_time` falls exactly halfway between two BM samples.
+    """
+    if epoch_data.shape[0] == 0:
+        raise ValueError("Cannot find a nearest timestamp in an empty array.")
+
+    index = int(np.searchsorted(epoch_data, target_time, side="left"))
+    if index == epoch_data.shape[0]:
+        return epoch_data.shape[0] - 1
+
+    if index > 0 and abs(epoch_data[index - 1] - target_time) <= abs(
+        epoch_data[index] - target_time
+    ):
+        return index - 1
+
+    return index
+
+
+def build_decimated_indices(
+    anchor_index: int, step: int, start_index: int, end_index: int
+) -> np.ndarray:
+    """
+    Build a decimated index sequence around `anchor_index`.
+
+    The returned indices walk backward and forward in `step` increments and always
+    include the anchor so the BM sequence remains centered on `tC`.
+    """
+    forward = np.arange(anchor_index, end_index, step, dtype=np.int64)
+    backward = np.arange(anchor_index - step, start_index - 1, -step, dtype=np.int64)
+    if backward.size == 0:
+        return forward
+
+    return np.concatenate((backward[::-1], forward))
+
+
+def build_synthetic_epochs(
+    t_a: int,
+    source_indices: np.ndarray,
+    anchor_index: int,
+    decimation_factor: int,
+    norm_rate: VecSec,
+) -> np.ndarray:
+    """
+    Convert decimated BM indices into a zero-jitter synthetic NM sequence.
+
+    Parameters
+    ----------
+    t_a : int
+        Last NM timestamp before the gap.
+    source_indices : np.ndarray
+        Decimated BM indices selected around `tC`.
+    anchor_index : int
+        BM index nearest `t_a`.
+    decimation_factor : int
+        `burst_rate / norm_rate`.
+    norm_rate : VecSec
+        Output NM rate for the gap.
+
+    Returns
+    -------
+    np.ndarray
+        Regular NM timestamps aligned to the BM anchor with zero jitter.
+    """
+    nm_spacing_ns = int(1e9 / norm_rate.value)
+    period_offsets = (source_indices - anchor_index) // decimation_factor
+    return (t_a + period_offsets * nm_spacing_ns).astype(np.int64, copy=False)
+
+
+def build_gap_fill_plan(
+    burst_epochs: np.ndarray,
+    burst_rate_segments: list[tuple[int, int]],
+    gap: np.ndarray,
+) -> GapFillPlan:
+    """
+    Build a BM-driven plan for a single NM gap per 7.3.4 step 3.
+
+    Select the BM time `tC` closest to `tA`, decimate around that anchor to the target
+    NM cadence, shift the decimated BM timestamps by `(tA - tC)`, and trim to the open
+    interval `(tA, tB)`.
+
+    Parameters
+    ----------
+    burst_epochs : np.ndarray
+        BM timestamps in TTJ2000 nanoseconds.
+    burst_rate_segments : list[tuple[int, int]]
+        Pre-computed BM rate segments from `_find_rate_segments`.
+    gap : np.ndarray
+        `(tA, tB, norm_rate)` gap descriptor.
+
+    Returns
+    -------
+    GapFillPlan
+        Synthetic NM timestamps plus the BM window required to interpolate them.
+    """
+    burst_epochs = _to_int64_ns(burst_epochs)
+    t_a = _to_int64_ns_scalar(gap[0])
+    t_b = _to_int64_ns_scalar(gap[1])
+    norm_rate = VecSec(int(gap[2]))
+    burst_rate, segment_start, segment_end = _find_segment_for_time(
+        burst_rate_segments, burst_epochs, t_a
+    )
+    if burst_rate.value % norm_rate.value != 0:
+        raise ValueError(
+            f"Burst rate {burst_rate.value} must be divisible by normal rate "
+            f"{norm_rate.value}."
+        )
+    if burst_rate.value <= norm_rate.value:
+        raise ValueError(
+            f"Burst rate {burst_rate.value} must be greater than normal rate "
+            f"{norm_rate.value}."
+        )
+
+    t_c_index = segment_start + find_nearest_epoch_index(
+        burst_epochs[segment_start:segment_end], t_a
+    )
+    decimation_factor = int(burst_rate.value / norm_rate.value)
+    source_indices = build_decimated_indices(
+        t_c_index, decimation_factor, segment_start, segment_end
+    )
+    synthetic_epochs = build_synthetic_epochs(
+        t_a, source_indices, t_c_index, decimation_factor, norm_rate
+    )
+
+    keep = (
+        (synthetic_epochs > t_a)
+        & (synthetic_epochs < t_b)
+        & (synthetic_epochs >= burst_epochs[segment_start])
+        & (synthetic_epochs <= burst_epochs[segment_end - 1])
+    )
+    synthetic_epochs = synthetic_epochs[keep]
+    source_indices = source_indices[keep]
+
+    required_seconds = (1 / norm_rate.value) * 2
+    burst_buffer = int(required_seconds * burst_rate.value)
+    if source_indices.size == 0:
+        burst_window_start = max(segment_start, t_c_index - burst_buffer)
+        burst_window_end = min(segment_end, t_c_index + burst_buffer + 1)
+    else:
+        burst_window_start = max(segment_start, int(source_indices[0]) - burst_buffer)
+        burst_window_end = min(segment_end, int(source_indices[-1]) + burst_buffer + 1)
+
+    return GapFillPlan(
+        t_a=t_a,
+        t_b=t_b,
+        norm_rate=norm_rate,
+        burst_rate=burst_rate,
+        synthetic_epochs=synthetic_epochs,
+        source_indices=source_indices.astype(np.int64, copy=False),
+        burst_window_start=burst_window_start,
+        burst_window_end=burst_window_end,
+    )
+
+
+def build_gap_fill_plans(
+    burst_dataset: xr.Dataset, gaps: np.ndarray
+) -> list[GapFillPlan]:
+    """
+    Build BM-driven fill plans for each detected NM gap.
+
+    BM rate segments are computed once per dataset and reused across all gaps.
+    """
+    if gaps.shape[0] == 0:
+        return []
+
+    burst_epochs = _to_int64_ns(burst_dataset["epoch"].data)
+    burst_vecsec_dict = get_vecsec_dict(burst_dataset)
+    burst_rate_segments = _find_rate_segments(burst_epochs, burst_vecsec_dict)
+    if len(burst_rate_segments) == 0:
+        default_rate = int(next(iter(burst_vecsec_dict.values())))
+        burst_rate_segments = [(0, default_rate)]
+
+    return [
+        build_gap_fill_plan(burst_epochs, burst_rate_segments, gap) for gap in gaps
+    ]
+
+
+def build_timeline_from_gap_plans(
+    epoch_data: np.ndarray, gap_fill_plans: list[GapFillPlan]
+) -> np.ndarray:
+    """Insert spec-derived synthetic epochs into the NM timeline."""
+    epoch_data = _to_int64_ns(epoch_data)
+    if len(gap_fill_plans) == 0:
+        return epoch_data.copy()
+
+    timeline_parts: list[np.ndarray] = []
+    last_index = 0
+    for gap_fill_plan in gap_fill_plans:
+        epoch_start_index = np.searchsorted(epoch_data, gap_fill_plan.t_a, side="left")
+        gap_start_in_epoch = (
+            epoch_start_index < epoch_data.shape[0]
+            and epoch_data[epoch_start_index] == gap_fill_plan.t_a
+        )
+        epoch_copy_end = epoch_start_index + int(gap_start_in_epoch)
+        timeline_parts.append(epoch_data[last_index:epoch_copy_end])
+        if gap_fill_plan.synthetic_epochs.size != 0:
+            timeline_parts.append(gap_fill_plan.synthetic_epochs)
+        last_index = int(np.searchsorted(epoch_data, gap_fill_plan.t_b, side="left"))
+
+    timeline_parts.append(epoch_data[last_index:])
+    return np.concatenate(timeline_parts)
+
+
+def _build_fallback_gap_fill_plan(
+    burst_epochs: np.ndarray,
+    burst_rate_segments: list[tuple[int, int]],
+    gap: np.ndarray,
+    filled_norm_timeline: np.ndarray,
+) -> GapFillPlan:
+    """
+    Build a no-NM fallback plan from the existing scaffold timeline.
+
+    Parameters
+    ----------
+    burst_epochs : np.ndarray
+        BM timestamps in TTJ2000 nanoseconds.
+    burst_rate_segments : list[tuple[int, int]]
+        Pre-computed BM rate segments from `_find_rate_segments`.
+    gap : np.ndarray
+        `(tA, tB, norm_rate)` gap descriptor.
+    filled_norm_timeline : np.ndarray
+        Scaffold output timeline for the fallback path.
+
+    Returns
+    -------
+    GapFillPlan
+        Minimal plan that preserves the current T024-style fallback behavior.
+    """
+    norm_epochs = _to_int64_ns(filled_norm_timeline[:, 0])
+    t_a = _to_int64_ns_scalar(gap[0])
+    t_b = _to_int64_ns_scalar(gap[1])
+    norm_rate = VecSec(int(gap[2]))
+    burst_rate, segment_start, segment_end = _find_segment_for_time(
+        burst_rate_segments, burst_epochs, t_a
+    )
+    synthetic_epochs = norm_epochs[(norm_epochs > gap[0]) & (norm_epochs < gap[1])]
+    synthetic_epochs = synthetic_epochs.astype(np.int64, copy=False)
+    output_cadence_ns = int(1e9 / norm_rate.value)
+    synthetic_epochs = synthetic_epochs[
+        (synthetic_epochs > burst_epochs[segment_start])
+        & (synthetic_epochs <= burst_epochs[segment_end - 1] - output_cadence_ns)
+    ]
+
+    required_seconds = (1 / norm_rate.value) * 2
+    burst_buffer = int(required_seconds * burst_rate.value)
+    if synthetic_epochs.size == 0:
+        burst_gap_start = find_nearest_epoch_index(burst_epochs, t_a)
+        burst_gap_end = find_nearest_epoch_index(burst_epochs, t_b)
+        source_indices = np.empty((0,), dtype=np.int64)
+        burst_window_start = max(segment_start, burst_gap_start - burst_buffer)
+        burst_window_end = min(segment_end, burst_gap_end + burst_buffer + 1)
+    else:
+        source_indices = np.array(
+            [
+                segment_start
+                + find_nearest_epoch_index(
+                    burst_epochs[segment_start:segment_end], int(timestamp)
+                )
+                for timestamp in synthetic_epochs
+            ],
+            dtype=np.int64,
+        )
+        burst_window_start = max(segment_start, int(source_indices[0]) - burst_buffer)
+        burst_window_end = min(segment_end, int(source_indices[-1]) + burst_buffer + 1)
+
+    return GapFillPlan(
+        t_a=t_a,
+        t_b=t_b,
+        norm_rate=norm_rate,
+        burst_rate=burst_rate,
+        synthetic_epochs=synthetic_epochs,
+        source_indices=source_indices,
+        burst_window_start=burst_window_start,
+        burst_window_end=burst_window_end,
+    )
+
+
+def build_default_gap_fill_plans(
+    burst_dataset: xr.Dataset,
+    gaps: np.ndarray,
+    filled_norm_timeline: np.ndarray,
+) -> list[GapFillPlan]:
+    """
+    Build simple plans from the existing NM scaffold timeline.
+
+    This preserves the current no-NM fallback behavior used by T024 while the
+    normal+burst path uses the spec-compliant BM shift/trim algorithm.
+    """
+    burst_epochs = _to_int64_ns(burst_dataset["epoch"].data)
+    burst_vecsec_dict = get_vecsec_dict(burst_dataset)
+    burst_rate_segments = _find_rate_segments(burst_epochs, burst_vecsec_dict)
+    if len(burst_rate_segments) == 0:
+        default_rate = int(next(iter(burst_vecsec_dict.values())))
+        burst_rate_segments = [(0, default_rate)]
+
+    return [
+        _build_fallback_gap_fill_plan(
+            burst_epochs, burst_rate_segments, gap, filled_norm_timeline
+        )
+        for gap in gaps
+    ]
 
 
 def generate_empty_norm_array(new_timeline: np.ndarray) -> np.ndarray:
@@ -415,11 +818,14 @@ def fill_normal_data(
         6-7 - compression flags.
     """
     if new_timeline is None:
-        new_timeline = normal_dataset["epoch"].data
+        new_timeline = _to_int64_ns(normal_dataset["epoch"].data)
+    else:
+        new_timeline = _to_int64_ns(new_timeline)
 
     filled_timeline = generate_empty_norm_array(new_timeline)
+    normal_epochs = _to_int64_ns(normal_dataset["epoch"].data)
 
-    for index, timestamp in enumerate(normal_dataset["epoch"].data):
+    for index, timestamp in enumerate(normal_epochs):
         timeline_index = np.searchsorted(new_timeline, timestamp)
         filled_timeline[timeline_index, 1:5] = normal_dataset["vectors"].data[index]
         filled_timeline[timeline_index, 5] = ModeFlags.NORM.value
@@ -432,7 +838,7 @@ def fill_normal_data(
 
 def interpolate_gaps(
     burst_dataset: xr.Dataset,
-    gaps: np.ndarray,
+    gap_data: list[GapFillPlan] | np.ndarray,
     filled_norm_timeline: np.ndarray,
     interpolation_function: InterpolationFunction,
 ) -> np.ndarray:
@@ -446,8 +852,8 @@ def interpolate_gaps(
     ----------
     burst_dataset : xarray.Dataset
         The L1B burst mode dataset.
-    gaps : numpy.ndarray
-        An array of gaps to fill, with shape (n, 2) where n is the number of gaps.
+    gap_data : list[GapFillPlan] | numpy.ndarray
+        A list of spec-derived gap plans, or legacy gap tuples for the no-NM fallback.
     filled_norm_timeline : numpy.ndarray
         Timeline filled with normal mode data in the shape (n, 8).
     interpolation_function : InterpolationFunction
@@ -460,95 +866,84 @@ def interpolate_gaps(
         Indices: 0 - epoch, 1-4 - vector x, y, z, and range, 5 - generated flag,
         6-7 - compression flags.
     """
-    burst_epochs = burst_dataset["epoch"].data
-    # Exclude range values
+    burst_epochs = _to_int64_ns(burst_dataset["epoch"].data)
+    norm_epochs = _to_int64_ns(filled_norm_timeline[:, 0])
     burst_vectors = burst_dataset["vectors"].data
-    # Default to two vectors per second
-    burst_vecsec_dict = {0: VecSec.TWO_VECS_PER_S.value}
-    if "vectors_per_second" in burst_dataset.attrs:
-        burst_vecsec_dict = vectors_per_second_from_string(
-            burst_dataset.attrs["vectors_per_second"]
+    if isinstance(gap_data, np.ndarray):
+        gap_fill_plans = build_default_gap_fill_plans(
+            burst_dataset, gap_data, filled_norm_timeline
         )
+    else:
+        gap_fill_plans = gap_data
 
-    for gap in gaps:
-        # TODO: we need extra data at the beginning and end of the gap
-        burst_gap_start = (np.abs(burst_epochs - gap[0])).argmin()
-        burst_gap_end = (np.abs(burst_epochs - gap[1])).argmin()
-        # if this gap is too big, we may be missing burst data at the start or end of
-        # the day and shouldn't use it here.
+    for gap_fill_plan in gap_fill_plans:
+        gap_timeline = gap_fill_plan.synthetic_epochs
+        if gap_timeline.size == 0:
+            continue
 
-        # for the CIC filter, we need 2x normal mode cadence seconds
-
-        norm_rate = VecSec(int(gap[2]))
-
-        # Input rate
-        # Find where burst_start is after the start of the timeline
-        burst_vecsec_index = (
-            np.searchsorted(
-                list(burst_vecsec_dict.keys()),
-                burst_epochs[burst_gap_start],
-                side="right",
-            )
-            - 1
+        short = (gap_timeline >= burst_epochs[gap_fill_plan.burst_window_start]) & (
+            gap_timeline <= burst_epochs[gap_fill_plan.burst_window_end - 1]
         )
-        burst_rate = VecSec(list(burst_vecsec_dict.values())[burst_vecsec_index])
+        if not np.any(short):
+            continue
 
-        required_seconds = (1 / norm_rate.value) * 2
-        burst_buffer = int(required_seconds * burst_rate.value)
-
-        burst_start = max(0, burst_gap_start - burst_buffer)
-        burst_end = min(len(burst_epochs) - 1, burst_gap_end + burst_buffer)
-
-        gap_timeline = filled_norm_timeline[
-            (filled_norm_timeline > gap[0]) & (filled_norm_timeline < gap[1])
-        ]
-
-        short = (gap_timeline >= burst_epochs[burst_start]) & (
-            gap_timeline <= burst_epochs[burst_end]
-        )
         num_short = int(short.sum())
+        if gap_timeline.size != num_short:
+            logger.warning(
+                "Clipping synthetic gap timeline from %d to %d samples for gap "
+                "[%d, %d] at %d->%d vec/s",
+                gap_timeline.size,
+                num_short,
+                gap_fill_plan.t_a,
+                gap_fill_plan.t_b,
+                gap_fill_plan.burst_rate.value,
+                gap_fill_plan.norm_rate.value,
+            )
 
-        if len(gap_timeline) != num_short:
-            print(f"Chopping timeline from {len(gap_timeline)} to {num_short}")
-
-        # Limit timestamps to only include the areas with burst data
         gap_timeline = gap_timeline[short]
-        # do not include range
+        gap_source_indices = gap_fill_plan.source_indices[short]
         adjusted_gap_timeline, gap_fill = interpolation_function(
-            burst_vectors[burst_start:burst_end, :3],
-            burst_epochs[burst_start:burst_end],
+            burst_vectors[
+                gap_fill_plan.burst_window_start : gap_fill_plan.burst_window_end, :3
+            ],
+            burst_epochs[
+                gap_fill_plan.burst_window_start : gap_fill_plan.burst_window_end
+            ],
             gap_timeline,
-            input_rate=burst_rate,
-            output_rate=norm_rate,
+            input_rate=gap_fill_plan.burst_rate,
+            output_rate=gap_fill_plan.norm_rate,
         )
+        adjusted_gap_timeline = adjusted_gap_timeline.astype(np.int64, copy=False)
+        source_lookup = {
+            int(timestamp): int(source_index)
+            for timestamp, source_index in zip(gap_timeline, gap_source_indices)
+        }
+        missing_timestamps = {int(timestamp) for timestamp in gap_timeline}
 
-        # gaps should not have data in timeline, still check it
         for index, timestamp in enumerate(adjusted_gap_timeline):
-            timeline_index = np.searchsorted(filled_norm_timeline[:, 0], timestamp)
-            if sum(
-                filled_norm_timeline[timeline_index, 1:4]
-            ) == 0 and burst_gap_start + index < len(burst_vectors):
-                filled_norm_timeline[timeline_index, 1:4] = gap_fill[index]
+            source_index = source_lookup[int(timestamp)]
+            timeline_index = np.searchsorted(norm_epochs, timestamp)
+            if filled_norm_timeline[timeline_index, 5] == ModeFlags.NORM.value:
+                raise RuntimeError(
+                    "Self-inconsistent data. Interpolated timestamps should not "
+                    "overwrite normal-mode samples."
+                )
 
-                filled_norm_timeline[timeline_index, 4] = burst_vectors[
-                    burst_gap_start + index, 3
-                ]
-                filled_norm_timeline[timeline_index, 5] = ModeFlags.BURST.value
-                filled_norm_timeline[timeline_index, 6:8] = burst_dataset[
-                    "compression_flags"
-                ].data[burst_gap_start + index]
+            filled_norm_timeline[timeline_index, 1:4] = gap_fill[index]
+            filled_norm_timeline[timeline_index, 4] = burst_vectors[source_index, 3]
+            filled_norm_timeline[timeline_index, 5] = ModeFlags.BURST.value
+            filled_norm_timeline[timeline_index, 6:8] = burst_dataset[
+                "compression_flags"
+            ].data[source_index]
+            missing_timestamps.discard(int(timestamp))
 
-        # for any timestamp that was not filled and is still missing, remove it
-        missing_timeline = np.setdiff1d(gap_timeline, adjusted_gap_timeline)
-
-        for timestamp in missing_timeline:
-            timeline_index = np.searchsorted(filled_norm_timeline[:, 0], timestamp)
+        for timestamp in missing_timestamps:
+            timeline_index = np.searchsorted(norm_epochs, timestamp)
             if filled_norm_timeline[timeline_index, 5] != ModeFlags.MISSING.value:
                 raise RuntimeError(
                     "Self-inconsistent data. "
                     "Gaps not included in final timeline should be missing."
                 )
-            np.delete(filled_norm_timeline, timeline_index)
 
     return filled_norm_timeline
 
@@ -557,8 +952,8 @@ def generate_timeline(epoch_data: np.ndarray, gaps: np.ndarray) -> np.ndarray:
     """
     Generate a new timeline from existing, gap-filled timeline and gaps.
 
-    The gaps are generated at a .5 second cadence, regardless of the cadence of the
-    existing data.
+    The gaps are generated at the cadence implied by the gap rate. If no rate is
+    provided, a default cadence of 0.5 seconds is used.
 
     Parameters
     ----------
@@ -573,15 +968,24 @@ def generate_timeline(epoch_data: np.ndarray, gaps: np.ndarray) -> np.ndarray:
     numpy.ndarray
         The new timeline, filled with the existing data and the generated gaps.
     """
-    full_timeline: np.ndarray = np.array([])
+    epoch_data = _to_int64_ns(epoch_data)
+    full_timeline: np.ndarray = np.array([], dtype=epoch_data.dtype)
     last_index = 0
     for gap in gaps:
         epoch_start_index = np.searchsorted(epoch_data, gap[0], side="left")
+        gap_start_in_epoch = (
+            epoch_start_index < epoch_data.shape[0]
+            and epoch_data[epoch_start_index] == _to_int64_ns_scalar(gap[0])
+        )
+        epoch_copy_end = epoch_start_index + int(gap_start_in_epoch)
         full_timeline = np.concatenate(
-            (full_timeline, epoch_data[last_index:epoch_start_index])
+            (full_timeline, epoch_data[last_index:epoch_copy_end])
         )
         generated_timestamps = generate_missing_timestamps(gap)
+        if gap_start_in_epoch and generated_timestamps.size != 0:
+            generated_timestamps = generated_timestamps[1:]
         if generated_timestamps.size == 0:
+            last_index = int(np.searchsorted(epoch_data, gap[1], side="left"))
             continue
 
         # Remove any generated timestamps that are already in the timeline
@@ -614,8 +1018,9 @@ def find_all_gaps(
     it will assume a nominal 1/2 second gap. A gap is defined as missing data from the
     expected sequence as defined by vectors_per_second_attr.
 
-    If start_of_day_ns and end_of_day_ns are provided, gaps at the beginning and end of
-    the day will be added if the epoch_data does not cover the full day.
+    Adjacent observed-cadence segments intentionally overlap by one sample when
+    searching for gaps. That overlap ensures a real gap that spans a rate transition
+    still appears in one of the inspected slices.
 
     Parameters
     ----------
@@ -639,37 +1044,47 @@ def find_all_gaps(
         specified as (start, end, vector_rate) where start and end both exist in the
         timeline.
     """
-    gaps: np.ndarray = np.zeros((0, 3))
+    epoch_data = _to_int64_ns(epoch_data)
+    gaps: np.ndarray = np.empty((0, 3), dtype=np.int64)
 
     # TODO: when we go back to the previous file, also retrieve expected
     #  vectors per second
 
     vecsec_dict = {0: VecSec.TWO_VECS_PER_S.value} | (vecsec_dict or {})
 
-    end_index = epoch_data.shape[0]
+    rate_segments = _find_rate_segments(epoch_data, vecsec_dict)
+    if rate_segments:
+        first_rate = rate_segments[0][1]
+        last_rate = rate_segments[-1][1]
+    else:
+        default_rate = next(iter(vecsec_dict.values()))
+        first_rate = default_rate
+        last_rate = default_rate
 
     if start_of_day_ns is not None and epoch_data[0] > start_of_day_ns:
         # Add a gap from the start of the day to the first timestamp
         gaps = np.concatenate(
-            (gaps, np.array([[start_of_day_ns, epoch_data[0], vecsec_dict[0]]]))
-        )
-
-    for start_time in reversed(sorted(vecsec_dict.keys())):
-        # Find the start index that is equal to or immediately after start_time
-        start_index = np.searchsorted(epoch_data, start_time, side="left")
-        gaps = np.concatenate(
             (
-                find_gaps(
-                    epoch_data[start_index : end_index + 1], vecsec_dict[start_time]
-                ),
                 gaps,
+                np.array([[start_of_day_ns, epoch_data[0], first_rate]], dtype=np.int64),
             )
         )
-        end_index = start_index
+
+    for index, (start_index, vectors_per_second) in enumerate(rate_segments):
+        next_start_index = (
+            rate_segments[index + 1][0]
+            if index + 1 < len(rate_segments)
+            else epoch_data.shape[0] - 1
+        )
+        epoch_slice = epoch_data[start_index : next_start_index + 1]
+        gaps = np.concatenate((gaps, find_gaps(epoch_slice, vectors_per_second)))
 
     if end_of_day_ns is not None and epoch_data[-1] < end_of_day_ns:
         gaps = np.concatenate(
-            (gaps, np.array([[epoch_data[-1], end_of_day_ns, vecsec_dict[start_time]]]))
+            (
+                gaps,
+                np.array([[epoch_data[-1], end_of_day_ns, last_rate]], dtype=np.int64),
+            )
         )
 
     return gaps
@@ -696,14 +1111,19 @@ def find_gaps(timeline_data: np.ndarray, vectors_per_second: int) -> np.ndarray:
         end_gap, as well as vectors_per_second. Start_gap and end_gap both correspond
         to points in timeline_data.
     """
+    if timeline_data.shape[0] < 2:
+        return np.empty((0, 3), dtype=np.int64)
+
     # Expected difference between timestamps in nanoseconds.
     expected_gap = 1 / vectors_per_second * 1e9
 
     diffs = abs(np.diff(timeline_data))
 
     # Gap can be up to 7.5% larger than expected vectors per second due to clock drift
-    gap_index = np.asarray(diffs - expected_gap > expected_gap * 0.075).nonzero()[0]
-    output: np.ndarray = np.zeros((len(gap_index), 3))
+    gap_index = np.asarray(diffs - expected_gap > expected_gap * GAP_TOLERANCE).nonzero()[
+        0
+    ]
+    output: np.ndarray = np.zeros((len(gap_index), 3), dtype=np.int64)
 
     for index, gap in enumerate(gap_index):
         output[index, :] = [
@@ -719,8 +1139,8 @@ def generate_missing_timestamps(gap: np.ndarray) -> np.ndarray:
     """
     Generate a new timeline from input gaps.
 
-    Any gaps specified in gaps will be filled with timestamps that are 0.5 seconds
-    apart.
+    Any gaps specified in gaps will be filled with timestamps at the gap rate. If the
+    gap rate is not included, the default cadence is 0.5 seconds.
 
     Parameters
     ----------
@@ -734,10 +1154,55 @@ def generate_missing_timestamps(gap: np.ndarray) -> np.ndarray:
     full_timeline: numpy.ndarray
         Completed timeline.
     """
-    # Generated timestamps should always be 0.5 seconds apart
-    difference_ns = 0.5 * 1e9
-    output: np.ndarray = np.arange(gap[0], gap[1], difference_ns)
+    difference_ns = int(0.5 * 1e9)
+    if gap.shape[0] > 2:
+        difference_ns = int(1e9 / int(gap[2]))
+
+    output: np.ndarray = np.arange(
+        _to_int64_ns_scalar(gap[0]),
+        _to_int64_ns_scalar(gap[1]),
+        difference_ns,
+        dtype=np.int64,
+    )
     return output
+
+
+def _is_expected_rate(timestamp_difference: float, vectors_per_second: int) -> bool:
+    """Return True when a timestamp spacing matches a rate within tolerance."""
+    expected_gap = 1 / vectors_per_second * 1e9
+    return abs(timestamp_difference - expected_gap) <= expected_gap * GAP_TOLERANCE
+
+
+def _find_rate_segments(
+    epoch_data: np.ndarray, vecsec_dict: dict[int, int]
+) -> list[tuple[int, int]]:
+    """
+    Build contiguous rate segments using observed cadence near each transition.
+
+    The validation data can switch cadence before the corresponding configuration time
+    appears in the metadata. Walk each configured transition backward while the observed
+    cadence already matches the new rate so gaps stay attached to the correct segment.
+    """
+    if epoch_data.shape[0] == 0:
+        return []
+
+    segments: list[tuple[int, int]] = []
+    for start_time, vectors_per_second in sorted(vecsec_dict.items()):
+        start_index = int(np.searchsorted(epoch_data, start_time, side="left"))
+        start_index = min(start_index, epoch_data.shape[0] - 1)
+        lower_bound = segments[-1][0] if segments else 0
+
+        while start_index > lower_bound and _is_expected_rate(
+            epoch_data[start_index] - epoch_data[start_index - 1], vectors_per_second
+        ):
+            start_index -= 1
+
+        if segments and start_index == segments[-1][0]:
+            segments[-1] = (start_index, vectors_per_second)
+        else:
+            segments.append((start_index, vectors_per_second))
+
+    return segments
 
 
 def vectors_per_second_from_string(vecsec_string: str) -> dict:
