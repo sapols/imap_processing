@@ -10,6 +10,8 @@ from imap_processing.mag.l1c.interpolation_methods import (
     estimate_rate,
 )
 from imap_processing.mag.l1c.mag_l1c import (
+    _find_rate_segments,
+    _find_segment_for_time,
     build_decimated_indices,
     build_gap_fill_plan,
     build_gap_fill_plans,
@@ -458,6 +460,19 @@ def test_find_nearest_epoch_index_prefers_earlier_on_tie():
     assert find_nearest_epoch_index(epoch_test, 8) == 1
 
 
+def test_find_segment_for_time_uses_precomputed_segments():
+    epoch_test = np.array([0, 500_000_000, 1_000_000_000, 1_250_000_000], dtype=np.int64)
+    rate_segments = [(0, 2), (2, 4)]
+
+    rate, segment_start, segment_end = _find_segment_for_time(
+        rate_segments, epoch_test, 1_100_000_000
+    )
+
+    assert rate == VecSec.FOUR_VECS_PER_S
+    assert segment_start == 2
+    assert segment_end == 4
+
+
 def test_build_decimated_indices_includes_anchor():
     output = build_decimated_indices(anchor_index=4, step=2, start_index=0, end_index=10)
     expected_output = np.array([0, 2, 4, 6, 8], dtype=np.int64)
@@ -478,9 +493,7 @@ def test_generate_missing_timestamps_uses_gap_rate():
 
 def test_build_gap_fill_plan_uses_shifted_burst_timestamps(burst_dataset):
     gap = np.array([2_000_000_000, 4_000_000_000, 2], dtype=np.int64)
-    gap_fill_plan = build_gap_fill_plan(
-        burst_dataset["epoch"].data, vectors_per_second_from_string("0:8"), gap
-    )
+    gap_fill_plan = build_gap_fill_plan(burst_dataset["epoch"].data, [(0, 8)], gap)
 
     expected_epochs = np.array([2.5, 3.0, 3.5]) * 1e9
     expected_source_indices = np.array([5, 9, 13], dtype=np.int64)
@@ -497,7 +510,7 @@ def test_build_gap_fill_plan_regularizes_burst_jitter():
         dtype=np.int64,
     )
     gap = np.array([2_000_000_000, 4_000_000_000, 2], dtype=np.int64)
-    gap_fill_plan = build_gap_fill_plan(burst_epochs, {0: 8}, gap)
+    gap_fill_plan = build_gap_fill_plan(burst_epochs, [(0, 8)], gap)
 
     expected_epochs = np.array([2.5, 3.0, 3.5]) * 1e9
     assert np.array_equal(gap_fill_plan.synthetic_epochs, expected_epochs)
@@ -510,11 +523,10 @@ def test_build_gap_fill_plan_uses_observed_burst_transition_boundary():
         [burst_start + index * 15_625_000 for index in range(512)], dtype=np.int64
     )
     gap = np.array([794_967_834_198_931_000, 794_967_837_198_931_000, 2], dtype=np.int64)
-    gap_fill_plan = build_gap_fill_plan(
-        burst_epochs,
-        {794_967_839_890_064_896: 64},
-        gap,
+    burst_rate_segments = _find_rate_segments(
+        burst_epochs, {794_967_839_890_064_896: 64}
     )
+    gap_fill_plan = build_gap_fill_plan(burst_epochs, burst_rate_segments, gap)
 
     assert gap_fill_plan.synthetic_epochs[0] == 794_967_835_198_931_000
     assert np.array_equal(
