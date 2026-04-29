@@ -318,6 +318,9 @@ def process_mag_l1c(
     day_end_ns = None
 
     if day_to_process is not None:
+        # NOTE: This [day - 30 min, day + 1 day + 30 min] window is also
+        # computed in Mag._validate_datasets (imap_processing/cli.py).
+        # If the MAG ±30-minute buffer ever changes, update both sites together.
         day_start = day_to_process.astype("datetime64[s]") - np.timedelta64(30, "m")
 
         # get the end of the day plus 30 minutes
