@@ -1,6 +1,7 @@
 """MAG L1C processing module."""
 
 import logging
+from typing import NamedTuple
 
 import numpy as np
 import xarray as xr
@@ -22,6 +23,8 @@ def mag_l1c(
     first_input_dataset: xr.Dataset,
     day_to_process: np.datetime64,
     second_input_dataset: xr.Dataset = None,
+    *,
+    neighbor_datasets: list[xr.Dataset] | None = None,
 ) -> xr.Dataset:
     """
     Will process MAG L1C data from L1A data.
@@ -40,6 +43,11 @@ def mag_l1c(
         The second input dataset to process. This should be burst if first_input_dataset
         was norm, or norm if first_input_dataset was burst. It should match the
         instrument - both inputs should be mago or magi.
+    neighbor_datasets : list[xr.Dataset], optional
+        Neighboring-day MAG L1B/L1C datasets supplied as dependencies. When the current
+        day has no usable normal mode data in the processing window, the L1C timeline is
+        inherited from a neighbor (see ``derive_inherited_timeline``). This path stays
+        dormant until the SDC delivers neighbor files as dependencies.
 
     Returns
     -------
@@ -63,9 +71,33 @@ def mag_l1c(
         first_input_dataset, second_input_dataset
     )
 
+    # When no usable normal mode data falls in the processing window, the L1C timeline
+    # can be inherited from a neighboring day. This path stays dormant until the SDC
+    # delivers neighbor files as dependencies.
+    inherited_timeline = None
+    if neighbor_datasets:
+        day_start_ns, day_end_ns = _day_window_ns(day_to_process)
+        if normal_mode_dataset is None or not has_usable_norm_in_window(
+            normal_mode_dataset, day_start_ns, day_end_ns
+        ):
+            inherited_timeline = derive_inherited_timeline(
+                neighbor_datasets, day_start_ns, day_end_ns
+            )
+
     interp_function = InterpolationFunction[configuration.L1C_INTERPOLATION_METHOD]
-    if burst_mode_dataset is not None:
+    if inherited_timeline is not None and burst_mode_dataset is not None:
+        logger.info(
+            "MAG L1C inheriting timeline from %s neighbor", inherited_timeline.source
+        )
         full_interpolated_timeline: np.ndarray = process_mag_l1c(
+            None,
+            burst_mode_dataset,
+            interp_function,
+            day_to_process,
+            inherited_timeline=inherited_timeline,
+        )
+    elif burst_mode_dataset is not None:
+        full_interpolated_timeline = process_mag_l1c(
             normal_mode_dataset, burst_mode_dataset, interp_function, day_to_process
         )
     elif normal_mode_dataset is not None:
@@ -272,11 +304,159 @@ def select_datasets(
     return normal_mode_dataset, burst_mode_dataset
 
 
+class InheritedTimeline(NamedTuple):
+    """
+    Cadence and phase inherited from a neighboring day's MAG product.
+
+    Attributes
+    ----------
+    rate : int
+        Vectors-per-second cadence for the synthetic timeline.
+    anchor_ns : int
+        A real epoch (TTJ2000 ns) from the neighbor. The synthetic timeline is
+        phase-aligned to this value.
+    source : str
+        Which neighbor product the timeline was inherited from, for logging.
+    """
+
+    rate: int
+    anchor_ns: int
+    source: str
+
+
+def _day_window_ns(day_to_process: np.datetime64) -> tuple[int, int]:
+    """
+    Return the L1C processing window in TTJ2000 nanoseconds.
+
+    The window is the processing day extended by 30 minutes on each side.
+
+    Parameters
+    ----------
+    day_to_process : numpy.datetime64
+        The day to process, in np.datetime64[D] format.
+
+    Returns
+    -------
+    tuple[int, int]
+        The (start, end) of the processing window in TTJ2000 nanoseconds.
+    """
+    day_start = day_to_process.astype("datetime64[s]") - np.timedelta64(30, "m")
+    day_end = (
+        day_to_process.astype("datetime64[s]")
+        + np.timedelta64(1, "D")
+        + np.timedelta64(30, "m")
+    )
+    return (
+        int(et_to_ttj2000ns(str_to_et(str(day_start)))),
+        int(et_to_ttj2000ns(str_to_et(str(day_end)))),
+    )
+
+
+def has_usable_norm_in_window(
+    normal_mode_dataset: xr.Dataset, day_start_ns: int, day_end_ns: int
+) -> bool:
+    """
+    Check whether the normal mode dataset has samples inside the processing window.
+
+    Parameters
+    ----------
+    normal_mode_dataset : xarray.Dataset
+        The normal mode dataset.
+    day_start_ns : int
+        Start of the processing window, in TTJ2000 nanoseconds.
+    day_end_ns : int
+        End of the processing window, in TTJ2000 nanoseconds.
+
+    Returns
+    -------
+    bool
+        True if at least one normal mode epoch falls within the window.
+    """
+    epoch = normal_mode_dataset["epoch"].data
+    return bool(np.any((epoch >= day_start_ns) & (epoch <= day_end_ns)))
+
+
+def derive_inherited_timeline(
+    neighbor_datasets: list[xr.Dataset],
+    day_start_ns: int,
+    day_end_ns: int,
+) -> InheritedTimeline | None:
+    """
+    Derive a timeline to inherit from a neighboring day's MAG product.
+
+    When the current day has no usable normal mode data, L1C inherits the normal-mode
+    cadence and phase from a neighboring day. A real normal mode L1B product is
+    preferred over an interpolated L1C product. The cadence is derived from the
+    neighbor's own epoch spacing, so no ``vectors_per_second`` attribute is required
+    (L1C output does not carry one).
+
+    Parameters
+    ----------
+    neighbor_datasets : list[xr.Dataset]
+        Neighboring-day MAG datasets supplied as dependencies. Normal mode L1B and L1C
+        datasets are usable; anything else is ignored.
+    day_start_ns : int
+        Start of the processing window, in TTJ2000 nanoseconds.
+    day_end_ns : int
+        End of the processing window, in TTJ2000 nanoseconds.
+
+    Returns
+    -------
+    InheritedTimeline or None
+        The inherited cadence and phase, or None if no usable neighbor is found.
+    """
+    norm_l1b: list[xr.Dataset] = []
+    l1c: list[xr.Dataset] = []
+    for dataset in neighbor_datasets:
+        if dataset["epoch"].data.size < 2:
+            continue
+        logical_source = dataset.attrs.get("Logical_source", "")
+        if isinstance(logical_source, list):
+            logical_source = logical_source[0]
+        if "l1b" in logical_source and "norm" in logical_source:
+            norm_l1b.append(dataset)
+        elif "l1c" in logical_source:
+            l1c.append(dataset)
+
+    # A real normal mode L1B is preferred over an interpolated L1C.
+    candidates = norm_l1b or l1c
+    if not candidates:
+        return None
+    source = "real_l1b_norm" if norm_l1b else "l1c"
+
+    # Among candidates, choose the one whose epochs sit closest to the window.
+    window_mid = (day_start_ns + day_end_ns) // 2
+    chosen = min(
+        candidates,
+        key=lambda dataset: int(np.min(np.abs(dataset["epoch"].data - window_mid))),
+    )
+    chosen_epoch = chosen["epoch"].data
+
+    # Derive the cadence from the neighbor's own epoch spacing and snap it to a valid
+    # vectors-per-second rate.
+    median_spacing = float(np.median(np.diff(chosen_epoch)))
+    if median_spacing <= 0:
+        return None
+    observed_rate = 1e9 / median_spacing
+    rate = min(
+        (vec_sec.value for vec_sec in VecSec),
+        key=lambda candidate: abs(candidate - observed_rate),
+    )
+    if abs(rate - observed_rate) > rate * L1C_TIMESTAMP_GAP_TOLERANCE:
+        return None
+
+    # Anchor on the neighbor epoch closest to the window; only the phase matters.
+    anchor_ns = int(chosen_epoch[np.argmin(np.abs(chosen_epoch - window_mid))])
+    return InheritedTimeline(rate=rate, anchor_ns=anchor_ns, source=source)
+
+
 def process_mag_l1c(
     normal_mode_dataset: xr.Dataset | None,
     burst_mode_dataset: xr.Dataset,
     interpolation_function: InterpolationFunction,
     day_to_process: np.datetime64 | None = None,
+    *,
+    inherited_timeline: InheritedTimeline | None = None,
 ) -> np.ndarray:
     """
     Create MAG L1C data from L1B datasets.
@@ -307,6 +487,10 @@ def process_mag_l1c(
         The day to process, in np.datetime64[D] format. This is used to fill
         gaps at the beginning or end of the day if needed. If not included, these
         gaps will not be filled.
+    inherited_timeline : InheritedTimeline, optional
+        Cadence and phase inherited from a neighboring day. When provided (and there is
+        no normal mode dataset), the whole-window timeline is built at the inherited
+        cadence and phase instead of the default 2 vectors-per-second day grid.
 
     Returns
     -------
@@ -339,6 +523,22 @@ def process_mag_l1c(
             normal_vecsec_dict = None
 
         gaps = find_all_gaps(norm_epoch, normal_vecsec_dict, day_start_ns, day_end_ns)
+    elif inherited_timeline is not None:
+        # No usable normal mode data: build a synthetic timeline at the neighbor's
+        # cadence, phase-aligned to its anchor. interpolate_gaps() filters gap
+        # interiors strictly, so the gap must start one cadence before the first
+        # aligned timestamp or that first sample would never be interpolated.
+        period_ns = int(1e9 / inherited_timeline.rate)
+        window_start = int(np.rint(day_start_ns))
+        window_end = int(np.rint(day_end_ns))
+        first_aligned_ns = window_start + (
+            (inherited_timeline.anchor_ns - window_start) % period_ns
+        )
+        gap_start_ns = first_aligned_ns - period_ns
+        norm_epoch = [gap_start_ns, window_end]
+        gaps = np.array(
+            [[gap_start_ns, window_end, inherited_timeline.rate]], dtype=np.int64
+        )
     else:
         norm_epoch = [day_start_ns, day_end_ns]
         gaps = np.array(

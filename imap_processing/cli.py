@@ -1268,6 +1268,51 @@ class Lo(ProcessInstrument):
         return datasets
 
 
+def _collect_mag_l1c_inputs(
+    dependencies: ProcessingInputCollection, sensor: str, start_date: str
+) -> tuple[list[xr.Dataset], list[xr.Dataset]]:
+    """
+    Partition MAG L1C dependency files into current-day inputs and neighbor context.
+
+    Current-day L1B norm/burst files for the given sensor are the primary L1C inputs.
+    L1B and L1C files from other dates are returned as neighbor context for inheriting
+    a timeline. A same-day L1C dependency is anomalous and is ignored.
+
+    Parameters
+    ----------
+    dependencies : ProcessingInputCollection
+        Object containing dependencies to process.
+    sensor : str
+        The MAG sensor, "mago" or "magi".
+    start_date : str
+        The processing day in YYYYMMDD format.
+
+    Returns
+    -------
+    tuple[list[xr.Dataset], list[xr.Dataset]]
+        The current-day input datasets and the neighboring-day context datasets.
+    """
+    current_day_inputs: list[xr.Dataset] = []
+    neighbor_datasets: list[xr.Dataset] = []
+    for path in dependencies.get_file_paths(source="mag", data_type="l1b"):
+        science_file = imap_data_access.ScienceFilePath(path.name)
+        if sensor not in science_file.descriptor:
+            continue
+        if science_file.start_date == start_date:
+            current_day_inputs.append(load_cdf(path))
+        else:
+            neighbor_datasets.append(load_cdf(path))
+    for path in dependencies.get_file_paths(source="mag", data_type="l1c"):
+        science_file = imap_data_access.ScienceFilePath(path.name)
+        if sensor not in science_file.descriptor:
+            continue
+        if science_file.start_date == start_date:
+            logger.info("Ignoring anomalous same-day MAG L1C dependency %s", path)
+            continue
+        neighbor_datasets.append(load_cdf(path))
+    return current_day_inputs, neighbor_datasets
+
+
 class Mag(ProcessInstrument):
     """Process MAG."""
 
@@ -1340,18 +1385,36 @@ class Mag(ProcessInstrument):
             ]
 
         if self.data_level == "l1c":
-            science_files = dependencies.get_file_paths(source="mag", data_type="l1b")
-            input_data = [load_cdf(dep) for dep in science_files]
-            # Input datasets can be in any order, and are validated within mag_l1c
-            if len(input_data) == 1:
-                datasets = [mag_l1c(input_data[0], current_day)]
-            elif len(input_data) == 2:
-                datasets = [mag_l1c(input_data[0], current_day, input_data[1])]
+            # MAG L1C is per-sensor; the descriptor is "norm-mago" or "norm-magi".
+            if self.descriptor.endswith("mago"):
+                sensor = "mago"
+            elif self.descriptor.endswith("magi"):
+                sensor = "magi"
             else:
                 raise ValueError(
-                    f"Invalid dependencies found for MAG L1C:"
-                    f"{dependencies}. Expected one or two dependencies."
+                    f"Unexpected MAG L1C descriptor '{self.descriptor}'; "
+                    f"expected norm-mago or norm-magi."
                 )
+            # Today's L1B norm/burst files are the primary inputs. Neighboring-day
+            # L1B/L1C files, supplied once the SDC delivers cross-day dependencies,
+            # provide timeline context for days with no usable normal mode data.
+            current_day_inputs, neighbor_datasets = _collect_mag_l1c_inputs(
+                dependencies, sensor, self.start_date
+            )
+            if not 1 <= len(current_day_inputs) <= 2:
+                raise ValueError(
+                    f"Invalid current-day L1B dependencies found for MAG L1C: "
+                    f"{dependency_list}. Expected one or two."
+                )
+            # Datasets can be in any order, and are validated within mag_l1c.
+            datasets = [
+                mag_l1c(
+                    current_day_inputs[0],
+                    current_day,
+                    current_day_inputs[1] if len(current_day_inputs) == 2 else None,
+                    neighbor_datasets=neighbor_datasets or None,
+                )
+            ]
         if self.data_level == "l1d":
             science_files = dependencies.get_file_paths(source="mag", data_type="l1c")
             science_files.extend(

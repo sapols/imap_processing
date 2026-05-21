@@ -10,11 +10,13 @@ from imap_processing.mag.l1c.interpolation_methods import (
     estimate_rate,
 )
 from imap_processing.mag.l1c.mag_l1c import (
+    derive_inherited_timeline,
     fill_normal_data,
     find_all_gaps,
     find_gaps,
     generate_missing_timestamps,
     generate_timeline,
+    has_usable_norm_in_window,
     interpolate_gaps,
     mag_l1c,
     process_mag_l1c,
@@ -1147,3 +1149,142 @@ def test_cic_filter_delay_compensation():
         f"{len(input_filtered_case2)} elements, vectors_filtered has "
         f"{len(vectors_filtered_case2)} elements"
     )
+
+
+@pytest.mark.parametrize("neighbor_kind", ["l1b_norm", "l1c"])
+def test_mag_l1c_inherits_neighbor_timeline_phase(neighbor_kind):
+    """With no normal mode data, L1C inherits the neighbor's cadence and phase.
+
+    Regression for issue 2925 (T017/T018): when the processing window has no usable
+    normal mode data, the L1C timeline is built from a neighboring day's product. The
+    neighbor here has a phase deliberately offset from the default day grid, so the
+    assertions fail if the neighbor context is ignored.
+    """
+    day = np.datetime64("2025-01-01")
+    day_start_ns, _ = _ttj2000_day_bounds(day)
+    period_ns = 500_000_000  # 2 vectors per second
+
+    # Neighbor normal-mode timeline, offset 137 ms off the default day grid.
+    phase_offset_ns = 137_000_000
+    neighbor_start = day_start_ns - 600 * 1_000_000_000 + phase_offset_ns
+    neighbor_epochs = np.arange(
+        neighbor_start,
+        neighbor_start + 300 * period_ns,
+        step=period_ns,
+        dtype=np.int64,
+    )
+    if neighbor_kind == "l1b_norm":
+        neighbor = _build_mag_l1b(neighbor_epochs, "imap_mag_l1b_norm-mago", "0:2")
+    else:
+        neighbor = _build_mag_l1b(neighbor_epochs, "imap_mag_l1c_norm-mago", "0:2")
+        # L1C output carries no vectors_per_second attribute; the cadence must come
+        # from the epoch spacing instead.
+        del neighbor.attrs["vectors_per_second"]
+
+    # The current day has burst data only, covering the first 2 minutes.
+    burst_epochs = np.arange(
+        day_start_ns,
+        day_start_ns + 120 * 1_000_000_000 + 1,
+        step=125_000_000,
+        dtype=np.int64,
+    )
+    burst = _build_mag_l1b(burst_epochs, "imap_mag_l1b_burst-mago", "0:8")
+
+    output = mag_l1c(burst, day, neighbor_datasets=[neighbor])
+    epochs_out = output["epoch"].data
+
+    assert len(epochs_out) > 0
+    # Every output timestamp rides the neighbor's phase grid...
+    assert np.all((epochs_out - neighbor_epochs[0]) % period_ns == 0)
+    # ...which is deliberately offset from the default day grid, confirming the
+    # neighbor context was used rather than ignored.
+    assert (epochs_out[0] - day_start_ns) % period_ns != 0
+    assert np.all(output["generated_flag"].data == ModeFlags.BURST.value)
+
+
+def test_mag_l1c_neighbor_vectors_never_enter_output():
+    """Neighbor datasets supply timeline only; their vectors must never appear.
+
+    Regression for issue 2925: T017/T018 inherit cadence and phase from a neighbor,
+    but the output vectors must come solely from the current day's burst data.
+    """
+    day = np.datetime64("2025-01-01")
+    day_start_ns, _ = _ttj2000_day_bounds(day)
+    period_ns = 500_000_000
+
+    neighbor_start = day_start_ns - 300 * 1_000_000_000
+    neighbor_epochs = np.arange(
+        neighbor_start,
+        neighbor_start + 200 * period_ns,
+        step=period_ns,
+        dtype=np.int64,
+    )
+    neighbor = _build_mag_l1b(neighbor_epochs, "imap_mag_l1b_norm-mago", "0:2")
+    # Impossible sentinel values; these must not leak into the output.
+    sentinel = 123456789.0
+    neighbor["vectors"].data = np.full((neighbor_epochs.size, 4), sentinel)
+
+    burst_epochs = np.arange(
+        day_start_ns,
+        day_start_ns + 120 * 1_000_000_000 + 1,
+        step=125_000_000,
+        dtype=np.int64,
+    )
+    burst = _build_mag_l1b(burst_epochs, "imap_mag_l1b_burst-mago", "0:8")
+
+    output = mag_l1c(burst, day, neighbor_datasets=[neighbor])
+
+    assert len(output["epoch"].data) > 0
+    assert not np.any(output["vectors"].data == sentinel)
+
+
+def test_mag_l1c_neighbor_datasets_none_is_noop():
+    """Passing neighbor_datasets=None or [] leaves the output unchanged.
+
+    The cross-day path must stay dormant when no neighbor files are supplied, so the
+    result is identical to omitting the argument entirely.
+    """
+    day = np.datetime64("2025-01-01")
+    norm, burst = _build_day_aligned_mixed_l1b(day)
+    baseline = mag_l1c(norm, day, burst)
+
+    for neighbors in (None, []):
+        norm_n, burst_n = _build_day_aligned_mixed_l1b(day)
+        result = mag_l1c(norm_n, day, burst_n, neighbor_datasets=neighbors)
+        assert np.array_equal(result["epoch"].data, baseline["epoch"].data)
+        assert np.array_equal(result["vectors"].data, baseline["vectors"].data)
+
+
+def test_derive_inherited_timeline_prefers_real_norm_over_l1c():
+    """A real normal mode L1B neighbor is preferred over an interpolated L1C."""
+    period_ns = 500_000_000
+    epochs = np.arange(0, 100 * period_ns, period_ns, dtype=np.int64)
+    norm_l1b = _build_mag_l1b(epochs, "imap_mag_l1b_norm-mago", "0:2")
+    l1c = _build_mag_l1b(epochs, "imap_mag_l1c_norm-mago", "0:2")
+
+    result = derive_inherited_timeline([l1c, norm_l1b], 0, 100 * period_ns)
+
+    assert result is not None
+    assert result.source == "real_l1b_norm"
+    assert result.rate == 2
+
+
+def test_derive_inherited_timeline_returns_none_without_usable_neighbor():
+    """Burst-only or empty neighbor lists yield no inheritable timeline."""
+    burst_epochs = np.arange(0, 100 * 125_000_000, 125_000_000, dtype=np.int64)
+    burst = _build_mag_l1b(burst_epochs, "imap_mag_l1b_burst-mago", "0:8")
+
+    assert derive_inherited_timeline([burst], 0, int(burst_epochs[-1])) is None
+    assert derive_inherited_timeline([], 0, 1) is None
+
+
+def test_has_usable_norm_in_window():
+    """The windowed normal-mode predicate detects samples inside vs outside."""
+    period_ns = 500_000_000
+    norm = _build_mag_l1b(
+        np.arange(1_000, 1_000 + 10 * period_ns, period_ns, dtype=np.int64),
+        "imap_mag_l1b_norm-mago",
+        "0:2",
+    )
+    assert has_usable_norm_in_window(norm, 0, 100 * period_ns) is True
+    assert has_usable_norm_in_window(norm, 200 * period_ns, 300 * period_ns) is False

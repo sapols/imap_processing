@@ -31,6 +31,7 @@ from imap_processing.cli import (
     Spacecraft,
     Swe,
     Ultra,
+    _collect_mag_l1c_inputs,
     _parse_args,
     _validate_args,
     main,
@@ -901,4 +902,42 @@ def test_post_processing(
         "imap_swe_l0_raw_20100105_v001.pkts",
         "naif0012.tls",
         "imap_sclk_0001.tsc",
+    ]
+
+
+def test_collect_mag_l1c_inputs_partitions_dependencies():
+    """MAG L1C dependency intake buckets current-day inputs vs neighbor context.
+
+    Regression for issue 2925: more than two MAG L1C dependencies - current-day L1B
+    plus neighboring-day context - must no longer be rejected.
+    """
+    l1b_paths = [
+        Path("imap_mag_l1b_norm-mago_20250101_v001.cdf"),
+        Path("imap_mag_l1b_burst-mago_20250101_v001.cdf"),
+        Path("imap_mag_l1b_norm-mago_20241231_v001.cdf"),
+        Path("imap_mag_l1b_norm-magi_20250101_v001.cdf"),
+    ]
+    l1c_paths = [
+        Path("imap_mag_l1c_norm-mago_20241231_v001.cdf"),
+        Path("imap_mag_l1c_norm-mago_20250101_v001.cdf"),
+    ]
+    dependencies = Mock()
+    dependencies.get_file_paths.side_effect = lambda source, data_type: (
+        l1b_paths if data_type == "l1b" else l1c_paths
+    )
+
+    with mock.patch("imap_processing.cli.load_cdf", side_effect=lambda path: path):
+        current_day_inputs, neighbor_datasets = _collect_mag_l1c_inputs(
+            dependencies, "mago", "20250101"
+        )
+
+    # Current-day mago L1B norm + burst; the magi file is a different sensor.
+    assert sorted(path.name for path in current_day_inputs) == [
+        "imap_mag_l1b_burst-mago_20250101_v001.cdf",
+        "imap_mag_l1b_norm-mago_20250101_v001.cdf",
+    ]
+    # Neighbors: prior-day L1B and prior-day L1C; the same-day L1C is ignored.
+    assert sorted(path.name for path in neighbor_datasets) == [
+        "imap_mag_l1b_norm-mago_20241231_v001.cdf",
+        "imap_mag_l1c_norm-mago_20241231_v001.cdf",
     ]
