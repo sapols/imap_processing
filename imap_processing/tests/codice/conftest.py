@@ -8,8 +8,17 @@ TEST_DATA_PATH = imap_module_directory / "tests" / "codice" / "data"
 TEST_DATA_L0_PATH = TEST_DATA_PATH / "l0_data"
 TEST_L0_FILE = TEST_DATA_L0_PATH / "imap_codice_l0_raw_20241110_v001.pkts"
 
-VALIDATION_FILE_DATE = "20250814"
-VALIDATION_FILE_VERSION = "v015"
+VALIDATION_FILE_DATE = "20260204"
+VALIDATION_FILE_VERSION = "v016"
+
+# IALiRT validation data is decoupled from the science products and pinned to
+# the original epoch. IALiRT no longer derives from the same kind of CoDICE L0
+# packets (it is sourced from a LASP API), so no L0 packets exist at the new
+# science epoch, and the issue #3242 spin-angle fix does not affect any IALiRT
+# output (HI_IALIRT_REF_SPIN_ANGLE feeds only the unused HI_IALIRT_SPIN_ANGLE).
+# Reconciling the IALiRT fixtures with the LASP-API data source is tracked in #3304.
+IALIRT_VALIDATION_FILE_DATE = "20250814"
+IALIRT_VALIDATION_FILE_VERSION = "v015"
 
 
 @pytest.fixture(scope="session")
@@ -107,7 +116,7 @@ def codice_lut_path():
                 / "codice"
                 / "data"
                 / "l1a_input"
-                / "imap_codice_l0_hi-counters-singles_20250814_v001.pkts"
+                / f"imap_codice_l0_hi-counters-singles_{VALIDATION_FILE_DATE}_v001.pkts"
             ]
         elif descriptor == "hi-counters-aggregated" and data_type == "l0":
             return [
@@ -116,7 +125,7 @@ def codice_lut_path():
                 / "codice"
                 / "data"
                 / "l1a_input"
-                / "imap_codice_l0_hi-counters-aggregated_20250814_v001.pkts"
+                / f"imap_codice_l0_hi-counters-aggregated_{VALIDATION_FILE_DATE}_v001.pkts"
             ]
         elif descriptor == "lo-counters-singles" and data_type == "l0":
             return [
@@ -125,7 +134,7 @@ def codice_lut_path():
                 / "codice"
                 / "data"
                 / "l1a_input"
-                / "imap_codice_l0_lo-counters-singles_20250814_v001.pkts"
+                / f"imap_codice_l0_lo-counters-singles_{VALIDATION_FILE_DATE}_v001.pkts"
             ]
         elif descriptor == "lo-counters-aggregated" and data_type == "l0":
             return [
@@ -134,7 +143,7 @@ def codice_lut_path():
                 / "codice"
                 / "data"
                 / "l1a_input"
-                / "imap_codice_l0_lo-counters-aggregated_20250814_v001.pkts"
+                / f"imap_codice_l0_lo-counters-aggregated_{VALIDATION_FILE_DATE}_v001.pkts"
             ]
         elif descriptor == "hskp" and data_type == "l0":
             return [
@@ -143,7 +152,7 @@ def codice_lut_path():
                 / "codice"
                 / "data"
                 / "l1a_input"
-                / "imap_codice_l0_hskp_20250814_v001.pkts"
+                / f"imap_codice_l0_hskp_{VALIDATION_FILE_DATE}_v001.pkts"
             ]
         elif descriptor == "lo-sw-species" and data_type == "l1b":
             return [
