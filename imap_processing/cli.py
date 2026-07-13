@@ -77,6 +77,7 @@ from imap_processing.mag.l1d.mag_l1d import mag_l1d
 from imap_processing.mag.l2.mag_l2 import mag_l2
 from imap_processing.spacecraft import quaternions
 from imap_processing.spice import pointing_frame, repoint, spin
+from imap_processing.spice.time import et_to_ttj2000ns, str_to_et
 from imap_processing.swapi.l1.swapi_l1 import swapi_l1
 from imap_processing.swapi.l2.swapi_l2 import swapi_l2
 from imap_processing.swapi.swapi_utils import read_swapi_lut_table
@@ -451,6 +452,8 @@ class ProcessInstrument(ABC):
         dependencies = self.pre_processing()
         logger.info("Beginning actual processing")
         products = self.do_processing(dependencies)
+        logger.info("Validating output datasets")
+        self._validate_datasets(products)
         logger.info("Beginning postprocessing (uploading data products)")
         self.post_processing(products, dependencies)
         self.cleanup()
@@ -513,6 +516,24 @@ class ProcessInstrument(ABC):
             List of products produced.
         """
         raise NotImplementedError
+
+    def _validate_datasets(self, processed_data: list[xr.Dataset | Path]) -> None:
+        """
+        Validate produced datasets before they are written to CDF.
+
+        The default implementation is a no-op. Subclasses may override this
+        method to enforce instrument-specific invariants and raise
+        ``ValueError`` if any product fails validation. This runs in
+        ``process()`` between ``do_processing`` and ``post_processing``, so a
+        failure prevents bad data from being written or uploaded.
+
+        Parameters
+        ----------
+        processed_data : list[xarray.Dataset | Path]
+            A list of datasets (products) and paths produced by the
+            do_processing method.
+        """
+        return
 
     def post_processing(
         self,
@@ -1461,6 +1482,76 @@ class Mag(ProcessInstrument):
         check_epochs_within_day_offsets(datasets, current_day)
 
         return datasets
+
+    def _validate_datasets(self, processed_data: list[xr.Dataset | Path]) -> None:
+        """
+        Reject MAG products whose epochs fall outside the day's expected window.
+
+        All MAG science (L1A through L2) and L1D ancillary products that
+        carry an ``epoch`` coord are expected to lie within
+        ``[start_date - 30 min, start_date + 1 day + 30 min]``. A product that
+        violates this almost always means an upstream input was for the wrong
+        day (e.g. a mis-named L0 file, as in issue #3060). Failing here
+        prevents bad data from being written to a CDF or uploaded to the SDC.
+
+        Parameters
+        ----------
+        processed_data : list[xarray.Dataset | Path]
+            A list of datasets (products) and paths produced by the
+            do_processing method.
+
+        Raises
+        ------
+        ValueError
+            If any dataset's epoch range is outside the expected window.
+        """
+        if self.start_date is None:
+            raise ValueError("MAG validation requires start_date to be set.")
+
+        bounds: tuple[float, float] | None = None
+        for ds in processed_data:
+            if not isinstance(ds, xr.Dataset) or "epoch" not in ds.coords:
+                continue
+
+            epoch_values = ds["epoch"].values
+            if epoch_values.size == 0:
+                continue
+
+            if bounds is None:
+                current_day = np.datetime64(
+                    f"{self.start_date[:4]}-{self.start_date[4:6]}"
+                    f"-{self.start_date[6:]}"
+                )
+                # NOTE: This [day - 30 min, day + 1 day + 30 min] window is
+                # also computed in process_mag_l1c
+                # (imap_processing/mag/l1c/mag_l1c.py). If the MAG ±30-minute
+                # buffer ever changes, update both sites together.
+                day_start = current_day.astype("datetime64[s]") - np.timedelta64(
+                    30, "m"
+                )
+                day_end = (
+                    current_day.astype("datetime64[s]")
+                    + np.timedelta64(1, "D")
+                    + np.timedelta64(30, "m")
+                )
+                lower_ns = float(et_to_ttj2000ns(str_to_et(str(day_start))))
+                upper_ns = float(et_to_ttj2000ns(str_to_et(str(day_end))))
+                bounds = (lower_ns, upper_ns)
+            lower_ns, upper_ns = bounds
+
+            min_epoch = int(np.min(epoch_values))
+            max_epoch = int(np.max(epoch_values))
+            if min_epoch < lower_ns or max_epoch > upper_ns:
+                logical_source = ds.attrs.get("Logical_source", "<unknown>")
+                parents = ds.attrs.get("Parents", "<not yet attached>")
+                raise ValueError(
+                    f"MAG epoch validation failed for {logical_source}: "
+                    f"observed epoch range [{min_epoch}, {max_epoch}] ns "
+                    f"falls outside expected window "
+                    f"[{int(lower_ns)}, {int(upper_ns)}] ns for "
+                    f"start_date={self.start_date}. "
+                    f"Parents: {parents}."
+                )
 
     def post_processing(
         self,

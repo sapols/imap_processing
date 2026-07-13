@@ -28,6 +28,8 @@ from imap_processing.cli import (
     Hit,
     Idex,
     Lo,
+    Mag,
+    ProcessInstrument,
     Spacecraft,
     Swe,
     Ultra,
@@ -36,6 +38,7 @@ from imap_processing.cli import (
     main,
 )
 from imap_processing.spice import config as spice_config
+from imap_processing.spice.time import et_to_ttj2000ns
 
 
 @pytest.fixture(autouse=True)
@@ -902,3 +905,98 @@ def test_post_processing(
         "naif0012.tls",
         "imap_sclk_0001.tsc",
     ]
+
+
+@pytest.fixture
+def mag_for_validation():
+    """Minimal Mag instance for unit testing _validate_datasets."""
+    return Mag(
+        data_level="l1b",
+        data_descriptor="burst-mago",
+        dependency_str="[]",
+        start_date="20251220",
+        repointing=None,
+        version="v002",
+        upload_to_sdc=False,
+    )
+
+
+def _make_mag_dataset(
+    epoch_ns_values, logical_source="imap_mag_l1b_burst-mago", parents=None
+):
+    """Build a minimal xr.Dataset with an int64 epoch coord and Logical_source."""
+    epoch = np.asarray(epoch_ns_values, dtype=np.int64)
+    ds = xr.Dataset(coords={"epoch": ("epoch", epoch)})
+    ds.attrs["Logical_source"] = logical_source
+    if parents is not None:
+        ds.attrs["Parents"] = parents
+    return ds
+
+
+def test_mag_validate_datasets_passes_for_valid_epochs(
+    mag_for_validation, furnish_kernels
+):
+    """Epochs inside [day - 30 min, day + 1 day + 30 min] do not raise."""
+    with furnish_kernels(["naif0012.tls"]):
+        midday_ns = int(et_to_ttj2000ns(spiceypy.str2et("2025-12-20T12:00:00")))
+        ds = _make_mag_dataset(
+            [midday_ns - 1_000_000_000, midday_ns, midday_ns + 1_000_000_000]
+        )
+        mag_for_validation._validate_datasets([ds])
+
+
+def test_mag_validate_datasets_raises_for_out_of_window_epochs(
+    mag_for_validation, furnish_kernels
+):
+    """Issue #3060 incident shape: day-30 epochs under a day-20 start_date."""
+    with furnish_kernels(["naif0012.tls"]):
+        bad_ns = int(et_to_ttj2000ns(spiceypy.str2et("2025-12-30T00:00:00")))
+        ds = _make_mag_dataset(
+            [bad_ns, bad_ns + 1_000_000_000],
+            logical_source="imap_mag_l1b_burst-mago",
+            parents=["imap_mag_l0_raw_20251220_v003.pkts"],
+        )
+        with pytest.raises(
+            ValueError, match="MAG epoch validation failed for imap_mag_l1b_burst-mago"
+        ) as excinfo:
+            mag_for_validation._validate_datasets([ds])
+    message = str(excinfo.value)
+    assert "20251220" in message
+    assert "imap_mag_l0_raw_20251220_v003.pkts" in message
+
+
+def test_mag_validate_datasets_skips_path_entries(mag_for_validation, tmp_path):
+    """Path entries in processed_data are silently ignored."""
+    mag_for_validation._validate_datasets([tmp_path / "written_already.cdf"])
+
+
+def test_mag_validate_datasets_skips_dataset_without_epoch(mag_for_validation):
+    """Datasets without an `epoch` coord are silently ignored."""
+    ds = xr.Dataset(coords={"foo": ("foo", [1, 2, 3])})
+    ds.attrs["Logical_source"] = "imap_mag_l1d_some-aux"
+    mag_for_validation._validate_datasets([ds])
+
+
+def test_mag_validate_datasets_skips_empty_epoch(mag_for_validation):
+    """Datasets with an empty epoch coord are silently ignored (nothing to check)."""
+    ds = _make_mag_dataset([])
+    mag_for_validation._validate_datasets([ds])
+
+
+def test_default_validate_datasets_is_noop():
+    """ProcessInstrument's default _validate_datasets is a no-op."""
+
+    class _Stub(ProcessInstrument):
+        def do_processing(self, dependencies):
+            return []
+
+    stub = _Stub(
+        data_level="l1a",
+        data_descriptor="sci",
+        dependency_str="[]",
+        start_date="20251220",
+        repointing=None,
+        version="v001",
+        upload_to_sdc=False,
+    )
+    assert stub._validate_datasets(["anything", 42, None]) is None
