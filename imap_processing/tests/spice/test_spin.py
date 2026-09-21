@@ -197,7 +197,13 @@ def test_get_spin_angle(spin_phases, degrees, expected, context):
 @pytest.mark.parametrize("query_met_times", [-1, 181])
 def test_get_spacecraft_spin_phase_value_error(query_met_times, fake_spin_data):
     """Test get_spacecraft_spin_phase() for raising ValueError."""
-    with pytest.raises(ValueError, match="Query times"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"loaded spin table only covers MET 0\.0 to 180\.0 .*"
+            r"Spin tables loaded: \['fake_spin_data\.csv'\]"
+        ),
+    ):
         _ = spin.get_spacecraft_spin_phase(query_met_times)
 
 

@@ -188,9 +188,14 @@ def interpolate_spin_data(query_met_times: float | npt.NDArray) -> pd.DataFrame:
     input_start_time = query_met_times.min()
     input_end_time = query_met_times.max()
     if input_start_time < spin_df_start_time or input_end_time >= spin_df_end_time:
+        first_spin_start_utc = spin_df["spin_start_utc"].iloc[0]
+        last_spin_start_utc = spin_df["spin_start_utc"].iloc[-1]
         raise ValueError(
-            f"Query times, {query_met_times} are outside of the spin data range, "
-            f"{spin_df_start_time, spin_df_end_time}."
+            f"Query times span MET {input_start_time} to {input_end_time}, but the "
+            f"loaded spin table only covers MET {spin_df_start_time} to "
+            f"{spin_df_end_time} (first spin starts {first_spin_start_utc} UTC, "
+            f"last spin starts {last_spin_start_utc} UTC). Spin tables loaded: "
+            f"{[path.name for path in config._spin_table_paths]}."
         )
 
     # Find all spin time that are less or equal to query_met_times.
