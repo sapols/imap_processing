@@ -1,15 +1,6 @@
-"""Tests the L1a processing for decommutated CoDICE data
-
-
-Create specific side_effect for each test. Tenzin tried to create generic
-function but we query either by data_type to get l0 file or
-by descriptor to get lut file. Since each product have their own
-l0 test file but processing pipeline has one l0 file, it
-caused too much complexity.
-"""
+"""Tests the L1a processing for decommutated CoDICE data"""
 
 import logging
-from unittest.mock import patch
 
 import cdflib
 import numpy as np
@@ -17,24 +8,22 @@ import pytest
 from imap_data_access import ProcessingInputCollection
 
 from imap_processing import imap_module_directory
-from imap_processing.cdf.utils import load_cdf, write_cdf
+from imap_processing.cdf.utils import write_cdf
 from imap_processing.codice.codice_l1a import process_l1a
 from imap_processing.codice.codice_l1a_de import l1a_direct_event
 from imap_processing.codice.utils import CODICEAPID
 from imap_processing.tests.codice.conftest import (
+    TEST_DATA_PATH,
     VALIDATION_FILE_DATE,
-    VALIDATION_FILE_VERSION,
-    assert_allclose_fillaware,
+    assert_epoch_delta_cdf_metadata,
+    assert_matches_validation,
+    file_paths_for,
+    l0_file,
 )
 from imap_processing.utils import filter_day_boundary_data, packet_file_to_datasets
 
-logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.external_test_data
 
-# epoch_delta = num_spins * spin_period / 2, with spin_period VALIDMAX = 16 s
-# and num_spins max = 16 in the current CoDICE timing model. That yields a
-# worst-case delta of 128 s = 128000000000 ns.
-EXPECTED_EPOCH_DELTA_VALIDMAX = 128000000000
 LO_MODE_SUPPORT_VARIABLES = [
     "rgfo_half_spin",
     "rgfo_spin_sector",
@@ -44,28 +33,45 @@ LO_MODE_SUPPORT_VARIABLES = [
     "nso_esa_step",
 ]
 
+# (descriptor, rtol, variables not compared)
+L1A_PRODUCTS = [
+    # TODO: compare spin_sector_pairs once our values and the validation
+    # files' "0-30 deg" style labels agree
+    ("lo-counters-aggregated", 1e-5, ["spin_sector_pairs"]),
+    ("lo-counters-singles", 1e-5, ["spin_sector_pairs"]),
+    ("lo-sw-priority", 1e-5, []),
+    ("lo-nsw-priority", 1e-5, []),
+    ("lo-sw-species", 1e-5, []),
+    ("hi-counters-aggregated", 1e-5, []),
+    ("hi-counters-singles", 1e-5, []),
+    # epoch_delta_minus/plus differ by up to 4.3e-5
+    ("hi-omni", 5e-5, []),
+    ("hi-sectored", 1e-5, []),
+    ("hi-priority", 1e-5, []),
+    ("lo-direct-events", 1e-5, []),
+    # TODO: 2 of 2172 num_events values mismatch (epoch 257 & 312, priority 3).
+    # combine_segmented_packets (imap_processing/utils.py) drops the
+    # entire first packet of a segmented group whenever that group's
+    # sequence flags look corrupted (see "Incorrect/incomplete sequence
+    # flags" warnings), even though num_events is a header field that
+    # lives entirely in that first packet and is unaffected by
+    # corruption in later continuation packets. Downstream, that
+    # priority is then treated as fully missing and zero-padded
+    # (codice_l1a_de.py process_de_data), so we report num_events=0
+    # while the validation file retains the real, recoverable count.
+    # The per-event science arrays are unaffected (correctly fillval
+    # on both sides) since the event byte payload really is unusable.
+    # The CoDICE team is aware and will decide if we need to recover
+    # these values before combine_segmented_packets.
+    ("hi-direct-events", 1e-5, ["num_events"]),
+]
 
-def assert_epoch_delta_cdf_metadata(cdf_file):
-    """Assert the written epoch delta variables use integer duration metadata."""
-    with cdflib.CDF(cdf_file) as cdf:
-        for variable in ("epoch_delta_minus", "epoch_delta_plus"):
-            info = cdf.varinq(variable)
-            attrs = cdf.varattsget(variable)
-            assert info.Data_Type_Description == "CDF_INT8"
-            assert attrs["FILLVAL"] == -9223372036854775808
-            assert attrs["FORMAT"] == "I19"
-            assert attrs["VALIDMIN"] == 0
-            assert attrs["VALIDMAX"] == EXPECTED_EPOCH_DELTA_VALIDMAX
 
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_updated_packet_version(mock_get_file_paths, codice_lut_path, caplog):
+def test_updated_packet_version(mock_get_file_paths, caplog):
     """Tests the new FSW changes (jan 2026)."""
-    codice_lut_path_jan = codice_lut_path(descriptor="l1a-sci-lut-jan")
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="fsw-changes", data_type="l0"),
-        *([codice_lut_path_jan] * 20),
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(
+        TEST_DATA_PATH / "l1a_input" / "imap_codice_l0_raw_20260130_v001.pkts"
+    )
     datasets = process_l1a(dependency=ProcessingInputCollection())
     # Assert that we have all of the expected datasets
     assert len(datasets) == 14
@@ -95,13 +101,9 @@ def test_updated_packet_version(mock_get_file_paths, codice_lut_path, caplog):
         )
 
 
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hskp(mock_get_file_paths, codice_lut_path):
+def test_hskp(mock_get_file_paths):
     """Tests the housekeeping."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hskp", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("hskp"))
     processed_datasets = process_l1a(dependency=ProcessingInputCollection())
 
     assert len(processed_datasets) == 2
@@ -115,538 +117,38 @@ def test_hskp(mock_get_file_paths, codice_lut_path):
     )
 
 
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_counters_aggregated(mock_get_file_paths, codice_lut_path):
-    """Tests lo-counters-aggregated."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-counters-aggregated", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-counters-aggregated_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
+@pytest.mark.parametrize(
+    ("descriptor", "rtol", "skip"),
+    L1A_PRODUCTS,
+    ids=[descriptor for descriptor, _, _ in L1A_PRODUCTS],
+)
+def test_l1a_validation(mock_get_file_paths, descriptor, rtol, skip):
+    """Tests each L1a product against the CoDICE team's validation data."""
+    mock_get_file_paths.side_effect = file_paths_for(l0_file(descriptor))
+    processed_data = filter_day_boundary_data(
+        process_l1a(dependency=ProcessingInputCollection())[0], VALIDATION_FILE_DATE
     )
-    val_data = load_cdf(val_path)
-    for variable in val_data.data_vars:
-        # TODO: ask Joey to remove reserved variables from validation files
-        if variable.startswith("reserved"):
-            continue
-        if processed_data[variable].shape != val_data[variable].shape:
-            # TODO: ask Joey to populate non-active variables in the
-            # validation files instead of leaving them empty (shape (0,)).
-            # Our processing fills non-active Lo counters with fillval
-            # placeholders at the full (epoch, esa_step, spin_sector_pairs)
-            # shape (see codice_l1a_lo_counters_aggregated.py), so these
-            # never match the validation file's shape.
-            continue
-        assert_allclose_fillaware(
-            processed_data[variable],
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
+    assert_matches_validation(processed_data, "l1a", descriptor, rtol, skip)
 
-    processed_data.attrs["Data_version"] = "001"
     cdf_file = write_cdf(processed_data, terminate_on_warning=True)
     assert (
         cdf_file.name
-        == f"imap_codice_l1a_lo-counters-aggregated_{VALIDATION_FILE_DATE}_v001.cdf"
+        == f"imap_codice_l1a_{descriptor}_{VALIDATION_FILE_DATE}_v001.0001.cdf"
     )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_counters_singles(mock_get_file_paths, codice_lut_path):
-    """Tests lo-counters-singles."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-counters-singles", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-counters-singles_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    for variable in val_data.data_vars:
-        assert_allclose_fillaware(
-            processed_data[variable],
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_lo-counters-singles_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_sw_priority(mock_get_file_paths, codice_lut_path):
-    """Tests lo-sw-priority."""
-
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-sw-priority", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-sw-priority_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    for variable in val_data.data_vars:
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    for variable in val_data.coords:
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_data[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_lo-sw-priority_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_nsw_priority(mock_get_file_paths, codice_lut_path):
-    """Tests lo-nsw-priority."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-nsw-priority", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-nsw-priority_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    for variable in val_data.data_vars:
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    for variable in val_data.coords:
-        # If string type, do equal.
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_data[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_lo-nsw-priority_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_sw_species(mock_get_file_paths, codice_lut_path):
-    """Tests lo-sw-species."""
-
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-sw-species", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-sw-species_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-
-    val_data = load_cdf(val_path)
-
-    # Process the input data
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-    # Compare only the common variables
-    for variable in val_data.data_vars:
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    for variable in val_data.coords:
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_data[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-        assert_allclose_fillaware(
-            processed_data[variable].values,
-            val_data[variable],
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-    processed_data.attrs["Data_version"] = "002"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_lo-sw-species_{VALIDATION_FILE_DATE}_v002.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_counters_aggregated(mock_get_file_paths, codice_lut_path):
-    """Tests hi-counters-aggregated."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-counters-aggregated", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-counters-aggregated_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-    for variable in val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_hi-counters-aggregated_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_counters_singles(mock_get_file_paths, codice_lut_path):
-    """Tests hi-counters-singles."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-counters-singles", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-counters-singles_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    for variable in val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_hi-counters-singles_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_omni(mock_get_file_paths, codice_lut_path):
-    """Tests hi-omni."""
-
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-omni", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-omni_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-    for variable in val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-4,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    for variable in val_data.coords:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-4,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert cdf_file.name == f"imap_codice_l1a_hi-omni_{VALIDATION_FILE_DATE}_v001.cdf"
     assert_epoch_delta_cdf_metadata(cdf_file)
 
 
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_sectored(mock_get_file_paths, codice_lut_path):
-    """Tests hi-sectored."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-sectored", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-sectored_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    for variable in val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-    for variable in val_data.coords:
-        # If _label, do string comparison
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_data[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name == f"imap_codice_l1a_hi-sectored_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_priority(mock_get_file_paths, codice_lut_path):
-    """Tests hi-priorities."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-priorities", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
-
-    # Process the input data
-    processed_data = process_l1a(ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-priority_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-
-    val_data = load_cdf(val_path)
-
-    for variable in val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-    for variable in val_data.coords:
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_data[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "001"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name == f"imap_codice_l1a_hi-priority_{VALIDATION_FILE_DATE}_v001.cdf"
-    )
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_lo_direct_events(mock_get_file_paths, codice_lut_path):
-    """Tests lo-direct-events."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-direct-events", data_type="l0"),
-    ]
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_lo-direct-events_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    for variable in val_data.data_vars:
-        if variable in [
-            "voltage_table",
-            "half_spin_per_esa_step",
-            "acquisition_time_per_esa_step",
-        ]:
-            # We do not have these variables for lo de. The validation data for
-            # these variables is empty.
-            continue
-        if variable in ["priority_label"]:
-            # Do string comparison for priority_label
-            assert np.array_equal(
-                processed_data[variable].values, val_data[variable].values
-            ), f"Mismatch in variable '{variable}'"
-            continue
-
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-    for variable in val_data.coords:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "002"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_lo-direct-events_{VALIDATION_FILE_DATE}_v002.cdf"
-    )
+def test_lo_direct_events_mode_variables_are_support_data(mock_get_file_paths):
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("lo-direct-events"))
+    cdf_file = write_cdf(process_l1a(dependency=ProcessingInputCollection())[0])
     with cdflib.CDF(cdf_file) as cdf:
         for variable in LO_MODE_SUPPORT_VARIABLES:
             attrs = cdf.varattsget(variable)
             assert attrs["VAR_TYPE"] == "support_data"
 
 
-def test_direct_events_incomplete_groups(codice_lut_path, caplog):
+def test_direct_events_incomplete_groups(caplog):
     """Tests lo-direct-events with a packet containing incomplete groups."""
-
-    # Get science data which is L0 packet file
-    science_file = codice_lut_path(descriptor="lo-direct-events", data_type="l0")[0]
 
     xtce_file = (
         imap_module_directory
@@ -654,7 +156,7 @@ def test_direct_events_incomplete_groups(codice_lut_path, caplog):
     )
     # Decom packet
     datasets_by_apid = packet_file_to_datasets(
-        science_file,
+        l0_file("lo-direct-events"),
         xtce_file,
     )
     apid = CODICEAPID.COD_LO_PHA
@@ -685,72 +187,3 @@ def test_direct_events_incomplete_groups(codice_lut_path, caplog):
     # Check logs report the first group with one fewer packet than baseline
     assert f"acq_start_seconds [{first_group_time}" in caplog.text
     assert f"counts [{baseline_count - 1}" in caplog.text
-
-
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_hi_direct_events(mock_get_file_paths, codice_lut_path):
-    """Tests hi-direct-events."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-direct-events", data_type="l0"),
-    ]
-
-    # Validation
-    val_path = (
-        imap_module_directory
-        / "tests/codice/data/l1a_validation/"
-        / (
-            f"imap_codice_l1a_hi-direct-events_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    val_data = load_cdf(val_path)
-
-    processed_data = process_l1a(dependency=ProcessingInputCollection())[0]
-    processed_data = filter_day_boundary_data(processed_data, VALIDATION_FILE_DATE)
-
-    for variable in val_data.data_vars:
-        if variable in ["priority_label"]:
-            # Do string comparison for priority_label
-            assert np.array_equal(
-                processed_data[variable].values, val_data[variable].values
-            ), f"Mismatch in variable '{variable}'"
-            continue
-
-        if variable == "num_events":
-            # TODO: 2 of 2172 values mismatch here (epoch 257 & 312, priority 3).
-            # combine_segmented_packets (imap_processing/utils.py) drops the
-            # entire first packet of a segmented group whenever that group's
-            # sequence flags look corrupted (see "Incorrect/incomplete sequence
-            # flags" warnings), even though num_events is a header field that
-            # lives entirely in that first packet and is unaffected by
-            # corruption in later continuation packets. Downstream, that
-            # priority is then treated as fully missing and zero-padded
-            # (codice_l1a_de.py process_de_data), so we report num_events=0
-            # while the validation file retains the real, recoverable count.
-            # The per-event science arrays are unaffected (correctly fillval
-            # on both sides) since the event byte payload really is unusable.
-            # The CoDICE team is aware and will decide if we need to recover
-            # these values before combine_sengmented_packts.
-            continue
-
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-    for variable in val_data.coords:
-        np.testing.assert_allclose(
-            processed_data[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-
-    processed_data.attrs["Data_version"] = "002"
-    cdf_file = write_cdf(processed_data, terminate_on_warning=True)
-    assert (
-        cdf_file.name
-        == f"imap_codice_l1a_hi-direct-events_{VALIDATION_FILE_DATE}_v002.cdf"
-    )
-    assert_epoch_delta_cdf_metadata(cdf_file)
