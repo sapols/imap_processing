@@ -132,17 +132,18 @@ Validation data
 
 .. code-block:: text
 
-   l0_data/           imap_codice_l0_raw_20241110_v001.pkts
-   l1a_input/         per-product .pkts slices, dated 20250814
+   l1a_input/         per-product .pkts slices
                       + imap_codice_l0_raw_20260130_v001.pkts (FSW change)
    l1a_lut/           SCI-LUT JSON, v005 (20251007) and v002 (20260129)
-   l1b_validation/    per-product L1B CDFs, 20250814 v015
-   l2_lut/            the seven L2 ancillary CSVs
+   l1a_validation/    per-product L1A CDFs
+   l1b_validation/    per-product L1B CDFs
+   l2_validation/     per-product L2 CDFs
+   l2_lut/            the L2 ancillary CSVs
 
-Pinned in ``conftest.py`` as ``VALIDATION_FILE_DATE = "20250814"`` and
-``VALIDATION_FILE_VERSION = "v015"``. The ``codice_lut_path`` fixture maps
-``(descriptor, data_type)`` to a path and **raises on anything unknown** - the
-quickest way to enumerate what a code path needs.
+Pinned in ``conftest.py`` as ``VALIDATION_FILE_DATE`` and
+``VALIDATION_FILE_VERSION``. ``conftest.file_paths_for`` maps each
+``get_file_paths`` request to a path and **raises on an unknown ancillary
+descriptor** - the quickest way to enumerate what a code path needs.
 
 Algorithm document section index
 --------------------------------

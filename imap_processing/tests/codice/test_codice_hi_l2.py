@@ -1,15 +1,8 @@
-from unittest.mock import patch
-
 import cdflib
 import numpy as np
 import pytest
-from imap_data_access.processing_input import (
-    AncillaryInput,
-    ProcessingInputCollection,
-    ScienceInput,
-)
+from imap_data_access.processing_input import ProcessingInputCollection
 
-from imap_processing import imap_module_directory
 from imap_processing.cdf.utils import load_cdf, write_cdf
 from imap_processing.codice.codice_l2 import (
     HI_SPECIES_DISPLAY_NAMES,
@@ -17,32 +10,13 @@ from imap_processing.codice.codice_l2 import (
 )
 from imap_processing.tests.codice.conftest import (
     VALIDATION_FILE_DATE,
-    VALIDATION_FILE_VERSION,
+    assert_l2_epoch_delta_cdf_metadata,
+    assert_matches_validation,
+    file_paths_for,
+    validation_file,
 )
 
 pytestmark = pytest.mark.external_test_data
-
-# epoch_delta = num_spins * spin_period / 2, with spin_period VALIDMAX = 16 s
-# and num_spins max = 16 in the current CoDICE timing model. That yields a
-# worst-case delta of 128 s = 128000000000 ns.
-EXPECTED_EPOCH_DELTA_VALIDMAX = 128000000000
-
-
-def assert_l2_epoch_delta_cdf_metadata(cdf_file):
-    """Assert L2 epoch delta vars and epoch links are written correctly."""
-    with cdflib.CDF(cdf_file) as cdf:
-        epoch_attrs = cdf.varattsget("epoch")
-        assert epoch_attrs["DELTA_MINUS_VAR"] == "epoch_delta_minus"
-        assert epoch_attrs["DELTA_PLUS_VAR"] == "epoch_delta_plus"
-
-        for variable in ("epoch_delta_minus", "epoch_delta_plus"):
-            info = cdf.varinq(variable)
-            attrs = cdf.varattsget(variable)
-            assert info.Data_Type_Description == "CDF_INT8"
-            assert attrs["FILLVAL"] == -9223372036854775808
-            assert attrs["FORMAT"] == "I19"
-            assert attrs["VALIDMIN"] == 0
-            assert attrs["VALIDMAX"] == EXPECTED_EPOCH_DELTA_VALIDMAX
 
 
 def _expected_hi_energy_labels(species: str, energies: np.ndarray) -> np.ndarray:
@@ -52,67 +26,10 @@ def _expected_hi_energy_labels(species: str, energies: np.ndarray) -> np.ndarray
     )
 
 
-@pytest.fixture
-def mock_get_file_paths(codice_lut_path):
-    with patch(
-        "imap_data_access.processing_input.ProcessingInputCollection.get_file_paths"
-    ) as mock_get_file_paths:
-        # Ensure the side effect treats science inputs as L1B for these L2 tests
-        mock_get_file_paths.side_effect = lambda descriptor, data_type=None: (
-            codice_lut_path(descriptor, data_type="l1b")
-        )
-        yield mock_get_file_paths
-
-
 def test_l2_hi_omni(mock_get_file_paths):
-    sci_input = ScienceInput(
-        f"imap_codice_l1b_hi-omni_{VALIDATION_FILE_DATE}_{VALIDATION_FILE_VERSION}.cdf"
-    )
-    anc_input = AncillaryInput("imap_codice_l2-hi-omni-efficiency_20251212_v004.csv")
-    dependencies = ProcessingInputCollection(anc_input, sci_input)
-
-    processed_l2 = process_codice_l2("hi-omni", dependencies)
-
-    val_data = (
-        imap_module_directory
-        / "tests/codice/data/l2_validation"
-        / f"imap_codice_l2_hi-omni_{VALIDATION_FILE_DATE}_{VALIDATION_FILE_VERSION}.cdf"
-    )
-
-    val_data = load_cdf(val_data)
-    for variable in val_data.data_vars:
-        if variable.startswith("unc_"):
-            continue
-        np.testing.assert_allclose(
-            processed_l2[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
-
-    # Check coordinates
-    for variable in val_data.coords:
-        if variable.startswith("energy_") and variable.endswith("_label"):
-            species = variable.removeprefix("energy_").removesuffix("_label")
-            np.testing.assert_array_equal(
-                processed_l2[variable].values,
-                _expected_hi_energy_labels(
-                    species,
-                    processed_l2[f"energy_{species}"].values,
-                ),
-                err_msg=f"Mismatch in coordinate '{variable}'",
-            )
-            continue
-        np.testing.assert_allclose(
-            processed_l2[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-        # Tests that dimensions match
-        assert processed_l2[variable].dims == val_data[variable].dims, (
-            f"Dimension mismatch in coordinate '{variable}'"
-        )
+    mock_get_file_paths.side_effect = file_paths_for(validation_file("l1b", "hi-omni"))
+    processed_l2 = process_codice_l2("hi-omni", ProcessingInputCollection())
+    assert_matches_validation(processed_l2, "l2", "hi-omni")
 
     processed_l2.attrs["Data_version"] = "001"
     omni_cdf_file = write_cdf(processed_l2)
@@ -187,85 +104,19 @@ def test_l2_hi_omni(mock_get_file_paths):
 
 
 def test_l2_hi_sectored(mock_get_file_paths):
-    anc_input = AncillaryInput(
-        "imap_codice_l2-hi-sectored-efficiency_20251212_v004.csv"
+    mock_get_file_paths.side_effect = file_paths_for(
+        validation_file("l1b", "hi-sectored")
     )
-    sci_input = ScienceInput(
-        f"imap_codice_l1b_hi-sectored_{VALIDATION_FILE_DATE}_{VALIDATION_FILE_VERSION}.cdf"
-    )
-    dependencies = ProcessingInputCollection(anc_input, sci_input)
+    processed_l2 = process_codice_l2("hi-sectored", ProcessingInputCollection())
+    assert_matches_validation(processed_l2, "l2", "hi-sectored")
 
-    processed_l2 = process_codice_l2("hi-sectored", dependencies)
-
-    val_data = (
-        imap_module_directory
-        / "tests/codice/data/l2_validation"
-        / (
-            f"imap_codice_l2_hi-sectored_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-
-    val_data = load_cdf(val_data)
-    # Check data variables
-    for variable in val_data.data_vars:
-        # Spin angle bug is fixed but the old validation data is outdated.
-        # Verified with new 20260201 L2 validation file from Joey.
-        if variable.startswith("unc_"):
-            continue
-        if variable == "spin_angle":
-            assert processed_l2[variable].dims == (
-                "spin_sector",
-                "elevation_angle",
-            )
-            spin_vals = processed_l2[variable].values
-            assert np.all(np.isfinite(spin_vals)), (
-                "spin_angle contains non-finite values"
-            )
-            assert np.min(spin_vals) >= 0.0, "spin_angle has values below 0 degrees"
-            assert np.max(spin_vals) <= 360.0, "spin_angle has values above 360 degrees"
-        else:
-            np.testing.assert_allclose(
-                processed_l2[variable].values,
-                val_data[variable].values,
-                rtol=1e-5,
-                err_msg=f"Mismatch in variable '{variable}'",
-            )
-        # Tests that dimensions match
+    val_data = load_cdf(validation_file("l2", "hi-sectored"))
+    for variable in val_data.variables:
+        # The validation file puts the epoch deltas on a placeholder dimension
         if variable in ["epoch_delta_plus", "epoch_delta_minus"]:
             continue
         assert processed_l2[variable].dims == val_data[variable].dims, (
-            f"Dimension mismatch in variable '{variable}'"
-        )
-
-    # Check coordinates
-    for variable in val_data.coords:
-        if variable.startswith("energy_") and variable.endswith("_label"):
-            species = variable.removeprefix("energy_").removesuffix("_label")
-            np.testing.assert_array_equal(
-                processed_l2[variable].values,
-                _expected_hi_energy_labels(
-                    species,
-                    processed_l2[f"energy_{species}"].values,
-                ),
-                err_msg=f"Mismatch in coordinate '{variable}'",
-            )
-            continue
-        if variable.endswith("_label"):
-            assert np.array_equal(
-                processed_l2[variable].values,
-                val_data[variable].values,
-            ), f"Mismatch in coordinate '{variable}'"
-            continue
-        np.testing.assert_allclose(
-            processed_l2[variable].values,
-            val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in coordinate '{variable}'",
-        )
-        # Tests that dimensions match
-        assert processed_l2[variable].dims == val_data[variable].dims, (
-            f"Dimension mismatch in coordinate '{variable}'"
+            f"Dimension mismatch in '{variable}'"
         )
 
     processed_l2.attrs["Data_version"] = "001"

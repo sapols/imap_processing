@@ -1,18 +1,15 @@
 """Tests the L2 processing of CoDICE L1 data"""
 
 from unittest import mock
-from unittest.mock import MagicMock, patch
 
 import cdflib
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
-from imap_data_access import AncillaryInput, ProcessingInputCollection
+from imap_data_access import ProcessingInputCollection
 from sammi.validation import CDFValidator
 
-from imap_processing import imap_module_directory
-from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.cdf.utils import load_cdf, write_cdf
 from imap_processing.codice.codice_l1a import process_l1a
 from imap_processing.codice.codice_l1b import process_codice_l1b
@@ -30,53 +27,17 @@ from imap_processing.codice.constants import (
     LO_SW_SOLAR_WIND_SPECIES_VARIABLE_NAMES,
 )
 from imap_processing.tests.codice.conftest import (
+    LUT_FILES,
+    TEST_DATA_PATH,
     VALIDATION_FILE_DATE,
-    VALIDATION_FILE_VERSION,
+    assert_l2_epoch_delta_cdf_metadata,
+    assert_matches_validation,
+    file_paths_for,
+    l0_file,
 )
 from imap_processing.utils import filter_day_boundary_data
 
 pytestmark = pytest.mark.external_test_data
-
-# epoch_delta = num_spins * spin_period / 2, with spin_period VALIDMAX = 16 s
-# and num_spins max = 16 in the current CoDICE timing model. That yields a
-# worst-case delta of 128 s = 128000000000 ns.
-EXPECTED_EPOCH_DELTA_VALIDMAX = 128000000000
-
-
-def assert_l2_epoch_delta_cdf_metadata(cdf_file):
-    """Assert L2 epoch delta vars and epoch links are written correctly."""
-    with cdflib.CDF(cdf_file) as cdf:
-        epoch_attrs = cdf.varattsget("epoch")
-        assert epoch_attrs["DELTA_MINUS_VAR"] == "epoch_delta_minus"
-        assert epoch_attrs["DELTA_PLUS_VAR"] == "epoch_delta_plus"
-
-        for variable in ("epoch_delta_minus", "epoch_delta_plus"):
-            info = cdf.varinq(variable)
-            attrs = cdf.varattsget(variable)
-            assert info.Data_Type_Description == "CDF_INT8"
-            assert attrs["FILLVAL"] == -9223372036854775808
-            assert attrs["FORMAT"] == "I19"
-            assert attrs["VALIDMIN"] == 0
-            assert attrs["VALIDMAX"] == EXPECTED_EPOCH_DELTA_VALIDMAX
-
-
-EXPECTED_LOGICAL_SOURCES = [
-    "imap_codice_l2_hi-direct-events",
-    "imap_codice_l2_lo-direct-events",
-]
-
-DIRECT_EVENT_LUTS = {
-    "lo-direct-events": [
-        "l2-lo-onboard-energy-table",
-        "l2-lo-onboard-energy-bins",
-        "l2-lo-onboard-mpq-cal",
-        "l2-lo-onboard-mpq-cal",
-    ],
-    "hi-direct-events": [
-        "l2-hi-energy-table",
-        "l2-hi-tof-table",
-    ],
-}
 
 DIRECT_EVENT_DISPLAY_TYPES = {
     "lo-direct-events": {
@@ -115,58 +76,12 @@ LO_DIRECT_EVENT_SUPPORT_VARIABLES = [
 ]
 
 
-@pytest.fixture
-def processing_dependencies(codice_lut_path):
-    eff_file = "imap_codice_l2-lo-efficiency_20251008_v001.csv"
-    gf_file = "imap_codice_l2-lo-gfactor_20251008_v001.csv"
-    mpq_file = "imap_codice_lo-mpq-cal_20250101_v001.csv"
-    return ProcessingInputCollection(
-        AncillaryInput(gf_file), AncillaryInput(eff_file), AncillaryInput(mpq_file)
-    )
-
-
-@pytest.fixture
-def mock_get_file_paths(codice_lut_path):
-    with patch(
-        "imap_data_access.processing_input.ProcessingInputCollection.get_file_paths"
-    ) as mock_get_file_paths:
-        # Ensure the side effect treats science inputs as L1B for these L2 tests
-        mock_get_file_paths.side_effect = lambda descriptor, data_type=None: (
-            codice_lut_path(descriptor, data_type="l1b")
-        )
-        yield mock_get_file_paths
-
-
-@pytest.fixture
-def mock_cdf_attrs():
-    # Create a mock ImapCdfAttributes object
-    cdf_attrs = MagicMock(spec=ImapCdfAttributes)
-    cdf_attrs.get_global_attributes.return_value = {
-        "global_attr_key": "global_attr_value"
-    }
-    cdf_attrs.get_variable_attributes.side_effect = lambda var, check_schema: {
-        "var1": {"attr1": "value1"},
-        "test-product-var2": {"attr2": "value2"},
-    }[var]
-    return cdf_attrs
-
-
-def _generate_direct_events_l2_file(mock_get_file_paths, codice_lut_path, descriptor):
+def _generate_direct_events_l2_file(mock_get_file_paths, descriptor):
     """Generate a fresh CoDICE direct-events L2 CDF for metadata assertions."""
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor=descriptor, data_type="l0")
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(l0_file(descriptor))
     l1a_cdf = process_l1a(ProcessingInputCollection())[0]
     processed_l1a_file = write_cdf(l1a_cdf)
-    file_path = processed_l1a_file.as_posix()
-    mock_get_file_paths.side_effect = [
-        [file_path],
-        [file_path],
-        *[
-            codice_lut_path(descriptor=lut_descriptor)
-            for lut_descriptor in DIRECT_EVENT_LUTS[descriptor]
-        ],
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(processed_l1a_file)
     processed_l2_ds = process_codice_l2(descriptor, ProcessingInputCollection())
     processed_l2_ds.attrs["Data_version"] = "001"
     return write_cdf(processed_l2_ds)
@@ -293,13 +208,11 @@ def test_compute_geometric_factors_mixed(mock_half_spin_per_esa_step):
     np.testing.assert_array_equal(result, expected)
 
 
-def test_get_geometric_factor_lut(processing_dependencies, mock_get_file_paths):
-    gfactor_lut = get_geometric_factor_lut(processing_dependencies)
+def test_get_geometric_factor_lut(mock_get_file_paths):
+    gfactor_lut = get_geometric_factor_lut(ProcessingInputCollection())
 
     # Load the csv files directly to compare
-    geometric_factors = pd.read_csv(
-        processing_dependencies.get_file_paths("l2-lo-gfactor")[0]
-    )
+    geometric_factors = pd.read_csv(TEST_DATA_PATH / LUT_FILES["l2-lo-gfactor"])
     full = (
         geometric_factors[geometric_factors["mode"] == "full"]
         .drop(["mode", "esa_step"], axis=1)
@@ -318,8 +231,8 @@ def test_get_geometric_factor_lut(processing_dependencies, mock_get_file_paths):
     np.testing.assert_array_equal(gfactor_lut["reduced"], reduced)
 
 
-def test_get_efficiency_lut(processing_dependencies, mock_get_file_paths):
-    efficiency_lut = get_efficiency_lut(processing_dependencies)
+def test_get_efficiency_lut(mock_get_file_paths):
+    efficiency_lut = get_efficiency_lut(ProcessingInputCollection())
     expected_colnames = ["esa_step", "product", "species"] + [
         f"position_{x}" for x in range(1, 25)
     ]
@@ -328,42 +241,36 @@ def test_get_efficiency_lut(processing_dependencies, mock_get_file_paths):
         assert col in efficiency_lut.columns, f"Missing column {col} in efficiency LUT"
 
 
-def test_get_tof_ns_from_mpq_lut(processing_dependencies, mock_get_file_paths):
-    tof_ns = get_mpq_calc_tof_conversion_vals(processing_dependencies)
+def test_get_tof_ns_from_mpq_lut(mock_get_file_paths):
+    tof_ns = get_mpq_calc_tof_conversion_vals(ProcessingInputCollection())
     assert tof_ns.shape == (1024,)
-    mpq_calc_lut_file = processing_dependencies.get_file_paths(
-        descriptor="l2-lo-onboard-mpq-cal"
-    )[0]
-    mpq_df = pd.read_csv(mpq_calc_lut_file, header=None)
+    mpq_df = pd.read_csv(
+        TEST_DATA_PATH / LUT_FILES["l2-lo-onboard-mpq-cal"], header=None
+    )
     expected_tof_ns = mpq_df.loc[6:, 1].to_numpy().astype(np.float64)
     # Calculated values should be more precise than LUT but should be close
     np.testing.assert_allclose(tof_ns, expected_tof_ns, atol=1e-5)
 
 
-def test_get_energy_kev_from_mpq_lut(processing_dependencies, mock_get_file_paths):
-    energy_kev = get_mpq_calc_energy_conversion_vals(processing_dependencies)
+def test_get_energy_kev_from_mpq_lut(mock_get_file_paths):
+    energy_kev = get_mpq_calc_energy_conversion_vals(ProcessingInputCollection())
     assert energy_kev.shape == (128,)
-    mpq_calc_lut_file = processing_dependencies.get_file_paths(
-        descriptor="l2-lo-onboard-mpq-cal"
-    )[0]
-    mpq_df = pd.read_csv(mpq_calc_lut_file, header=None)
+    mpq_df = pd.read_csv(
+        TEST_DATA_PATH / LUT_FILES["l2-lo-onboard-mpq-cal"], header=None
+    )
     expected_e_kev = mpq_df.loc[5, 4:].to_numpy().astype(np.float64)
     # Calculated values should be more precise than LUT but should be close
     np.testing.assert_allclose(energy_kev, expected_e_kev, rtol=0.01)
 
 
-def test_get_hi_de_luts(processing_dependencies, mock_get_file_paths):
-    # Mock get_file_paths to return specific files for hi-energy-table and hi-tof-table
-    energy_table, tof_table = get_hi_de_luts(processing_dependencies)
+def test_get_hi_de_luts(mock_get_file_paths):
+    energy_table, tof_table = get_hi_de_luts(ProcessingInputCollection())
     assert energy_table.shape == (2048, 48)
     assert tof_table.shape == (1024, 2)
 
 
-def test_process_lo_species_intensity(mock_get_file_paths, codice_lut_path):
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-sw-species", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
+def test_process_lo_species_intensity(mock_get_file_paths):
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("lo-sw-species"))
     processed_l1a_file = write_cdf(process_l1a(ProcessingInputCollection())[0])
     l1b_data = process_codice_l1b(processed_l1a_file)
     l1b_val_data_processed = l1b_data.copy()
@@ -447,44 +354,17 @@ def test_process_lo_missing_species_intensity():
             )
 
 
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_codice_l2_sw_species_intensity(mock_get_file_paths, codice_lut_path):
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-sw-species", data_type="l0"),
-        codice_lut_path(descriptor="l1a-sci-lut"),
-    ]
+def test_codice_l2_sw_species_intensity(mock_get_file_paths):
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("lo-sw-species"))
     l1a_ds = filter_day_boundary_data(
         process_l1a(ProcessingInputCollection())[0], VALIDATION_FILE_DATE
     )
     processed_l1a_file = write_cdf(l1a_ds)
     processed_l1b_file = write_cdf(process_codice_l1b(processed_l1a_file))
-    # Mock get_files for l2
-    mock_get_file_paths.side_effect = [
-        [processed_l1b_file.as_posix()],
-        codice_lut_path(descriptor="l2-lo-gfactor"),
-        codice_lut_path(descriptor="l2-lo-efficiency"),
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(processed_l1b_file)
     processed_2_ds = process_codice_l2("lo-sw-species", ProcessingInputCollection())
-    l2_val_data = (
-        imap_module_directory
-        / "tests"
-        / "codice"
-        / "data"
-        / "l2_validation"
-        / (
-            f"imap_codice_l2_lo-sw-species_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-    l2_val_data = load_cdf(l2_val_data)
+    assert_matches_validation(processed_2_ds, "l2", "lo-sw-species")
 
-    for variable in l2_val_data.data_vars:
-        np.testing.assert_allclose(
-            processed_2_ds[variable].values,
-            l2_val_data[variable].values,
-            rtol=1e-5,
-            err_msg=f"Mismatch in variable '{variable}'",
-        )
     processed_2_ds.attrs["Data_version"] = "001"
     assert processed_2_ds.attrs["Logical_source"] == "imap_codice_l2_lo-sw-species"
     cdf_path = write_cdf(processed_2_ds)
@@ -517,29 +397,14 @@ def test_codice_l2_sw_species_intensity(mock_get_file_paths, codice_lut_path):
         assert "DEPEND_1" not in energy_per_charge_attrs
 
 
-@pytest.mark.xfail(
-    reason="SPDF ISTP validation API is down. Remove this xfail marker when fixed."
-)
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_codice_l2_lo_de(mock_get_file_paths, codice_lut_path):
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="lo-direct-events", data_type="l0")
-    ]
+def test_codice_l2_lo_de(mock_get_file_paths):
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("lo-direct-events"))
     l1a_cdf = filter_day_boundary_data(
         process_l1a(ProcessingInputCollection())[0], VALIDATION_FILE_DATE
     )
 
     processed_l1a_file = write_cdf(l1a_cdf)
-    file_path = processed_l1a_file.as_posix()
-    # Mock get_files for l2
-    mock_get_file_paths.side_effect = [
-        [file_path],
-        [file_path],
-        codice_lut_path(descriptor="l2-lo-onboard-energy-table"),
-        codice_lut_path(descriptor="l2-lo-onboard-energy-bins"),
-        codice_lut_path(descriptor="l2-lo-onboard-mpq-cal"),
-        codice_lut_path(descriptor="l2-lo-onboard-mpq-cal"),
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(processed_l1a_file)
 
     processed_l2_ds = process_codice_l2("lo-direct-events", ProcessingInputCollection())
     l1a_input_ds = load_cdf(processed_l1a_file)
@@ -565,41 +430,8 @@ def test_codice_l2_lo_de(mock_get_file_paths, codice_lut_path):
         expected_spin_sector,
         err_msg="LO direct-event spin_sector values changed unexpectedly",
     )
+    assert_matches_validation(processed_l2_ds, "l2", "lo-direct-events", rtol=5e-5)
 
-    l2_val_data = (
-        imap_module_directory
-        / "tests"
-        / "codice"
-        / "data"
-        / "l2_validation"
-        / (
-            f"imap_codice_l2_lo-direct-events_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
-    )
-
-    l2_val_data = load_cdf(l2_val_data)
-
-    for variable in l2_val_data.data_vars:
-        if variable in ["rgfo_half_spin", "rgfo_spin_sector", "rgfo_esa_step"]:
-            # Skips variables that are not needed for direct events
-            continue
-        if l2_val_data[variable].values.size == 0:
-            continue
-        if "label" in variable:
-            np.testing.assert_array_equal(
-                processed_l2_ds[variable].values,
-                l2_val_data[variable].values,
-                err_msg=f"Mismatch in variable '{variable}'",
-            )
-        else:
-            np.testing.assert_allclose(
-                processed_l2_ds[variable].values,
-                l2_val_data[variable].values,
-                rtol=5e-5,
-                err_msg=f"Mismatch in variable '{variable}'",
-                equal_nan=True,
-            )
     processed_l2_ds.attrs["Data_version"] = "001"
     assert processed_l2_ds.attrs["Logical_source"] == "imap_codice_l2_lo-direct-events"
     file = write_cdf(processed_l2_ds)
@@ -618,71 +450,33 @@ def test_codice_l2_lo_de(mock_get_file_paths, codice_lut_path):
     load_cdf(file)
 
 
-@pytest.mark.xfail(
-    reason="SPDF ISTP validation API is down. Remove this xfail marker when fixed."
-)
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
-def test_codice_l2_hi_de(mock_get_file_paths, codice_lut_path):
-    mock_get_file_paths.side_effect = [
-        codice_lut_path(descriptor="hi-direct-events", data_type="l0")
-    ]
+def test_codice_l2_hi_de(mock_get_file_paths):
+    mock_get_file_paths.side_effect = file_paths_for(l0_file("hi-direct-events"))
     l1a_cdf = filter_day_boundary_data(
         process_l1a(ProcessingInputCollection())[0], VALIDATION_FILE_DATE
     )
 
     processed_l1a_file = write_cdf(l1a_cdf)
-    file_path = processed_l1a_file.as_posix()
-    # Mock get_files for l2
-    mock_get_file_paths.side_effect = [
-        [file_path],
-        [file_path],
-        codice_lut_path(descriptor="l2-hi-energy-table"),
-        codice_lut_path(descriptor="l2-hi-tof-table"),
-    ]
+    mock_get_file_paths.side_effect = file_paths_for(processed_l1a_file)
 
     processed_l2_ds = process_codice_l2("hi-direct-events", ProcessingInputCollection())
-    l2_val_data = (
-        imap_module_directory
-        / "tests"
-        / "codice"
-        / "data"
-        / "l2_validation"
-        / (
-            f"imap_codice_l2_hi-direct-events_{VALIDATION_FILE_DATE}"
-            f"_{VALIDATION_FILE_VERSION}.cdf"
-        )
+    # TODO: 2 of 2172 num_events values mismatch here (epoch 257 & 312, priority 3).
+    # combine_segmented_packets (imap_processing/utils.py) drops the
+    # entire first packet of a segmented group whenever that group's
+    # sequence flags look corrupted (see "Incorrect/incomplete sequence
+    # flags" warnings), even though num_events is a header field that
+    # lives entirely in that first packet and is unaffected by
+    # corruption in later continuation packets. Downstream, that
+    # priority is then treated as fully missing and zero-padded
+    # (codice_l1a_de.py process_de_data), so we report num_events=0
+    # while the validation file retains the real, recoverable count.
+    # Fix planned in a follow-up PR: recover num_events/byte_count
+    # from the raw first packet before it gets dropped, instead of
+    # hardcoding 0, for groups dropped due to bad sequence flags
+    # (as opposed to packets genuinely never received).
+    assert_matches_validation(
+        processed_l2_ds, "l2", "hi-direct-events", rtol=5e-5, skip=["num_events"]
     )
-    l2_val_data = load_cdf(l2_val_data)
-    for variable in l2_val_data.data_vars:
-        if "label" in variable:
-            np.testing.assert_array_equal(
-                processed_l2_ds[variable].values,
-                l2_val_data[variable].values,
-                err_msg=f"Mismatch in variable '{variable}'",
-            )
-        elif variable == "num_events":
-            # TODO: 2 of 2172 values mismatch here (epoch 257 & 312, priority 3).
-            # combine_segmented_packets (imap_processing/utils.py) drops the
-            # entire first packet of a segmented group whenever that group's
-            # sequence flags look corrupted (see "Incorrect/incomplete sequence
-            # flags" warnings), even though num_events is a header field that
-            # lives entirely in that first packet and is unaffected by
-            # corruption in later continuation packets. Downstream, that
-            # priority is then treated as fully missing and zero-padded
-            # (codice_l1a_de.py process_de_data), so we report num_events=0
-            # while the validation file retains the real, recoverable count.
-            # Fix planned in a follow-up PR: recover num_events/byte_count
-            # from the raw first packet before it gets dropped, instead of
-            # hardcoding 0, for groups dropped due to bad sequence flags
-            # (as opposed to packets genuinely never received).
-            continue
-        else:
-            np.testing.assert_allclose(
-                processed_l2_ds[variable].values,
-                l2_val_data[variable].values,
-                rtol=5e-5,
-                err_msg=f"Mismatch in variable '{variable}'",
-            )
 
     processed_l2_ds.attrs["Data_version"] = "001"
     assert processed_l2_ds.attrs["Logical_source"] == "imap_codice_l2_hi-direct-events"
@@ -699,13 +493,10 @@ def test_codice_l2_hi_de(mock_get_file_paths, codice_lut_path):
 
 
 @pytest.mark.parametrize("descriptor", ["lo-direct-events", "hi-direct-events"])
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
 def test_codice_l2_direct_events_display_type_cdf_metadata(
-    mock_get_file_paths, codice_lut_path, descriptor
+    mock_get_file_paths, descriptor
 ):
-    file = _generate_direct_events_l2_file(
-        mock_get_file_paths, codice_lut_path, descriptor
-    )
+    file = _generate_direct_events_l2_file(mock_get_file_paths, descriptor)
     with cdflib.CDF(str(file)) as cdf_file:
         for variable, expected_display_type in DIRECT_EVENT_DISPLAY_TYPES[
             descriptor
@@ -767,13 +558,10 @@ def test_codice_l2_direct_events_display_type_cdf_metadata(
             )
 
 
-@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
 def test_codice_l2_lo_direct_events_support_var_type_cdf_metadata(
-    mock_get_file_paths, codice_lut_path
+    mock_get_file_paths,
 ):
-    file = _generate_direct_events_l2_file(
-        mock_get_file_paths, codice_lut_path, "lo-direct-events"
-    )
+    file = _generate_direct_events_l2_file(mock_get_file_paths, "lo-direct-events")
     with cdflib.CDF(str(file)) as cdf_file:
         written_variables = set(cdf_file.cdf_info().zVariables)
         assert set(LO_DIRECT_EVENT_SUPPORT_VARIABLES) <= written_variables

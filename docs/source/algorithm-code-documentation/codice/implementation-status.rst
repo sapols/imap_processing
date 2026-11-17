@@ -355,13 +355,13 @@ Test coverage
      - Table-ID grouping.
 
 Validation inputs live under ``imap_processing/tests/codice/data/``
-(``l0_data/``, ``l1a_input/``, ``l1b_validation/``, ``l1a_lut/``, ``l2_lut/``)
-and are pinned in ``conftest.py`` by ``VALIDATION_FILE_DATE = "20250814"`` and
-``VALIDATION_FILE_VERSION = "v015"``. ``conftest.codice_lut_path`` is a
-``side_effect`` callable that stands in for
-``ProcessingInputCollection.get_file_paths`` - **it raises ``ValueError`` on an
-unknown descriptor**, which is the fastest way to discover which ancillary files
-a new code path needs.
+(``l1a_input/``, ``l1a_lut/``, ``l2_lut/``, and ``l1a_validation/``,
+``l1b_validation/``, ``l2_validation/``) and are pinned in ``conftest.py`` by
+``VALIDATION_FILE_DATE`` and ``VALIDATION_FILE_VERSION``.
+``conftest.file_paths_for`` builds a ``side_effect`` that stands in for
+``ProcessingInputCollection.get_file_paths`` - **it raises ``KeyError`` on an
+unknown ancillary descriptor**, which is the fastest way to discover which
+ancillary files a new code path needs.
 
 Untested paths worth knowing about:
 
